@@ -706,6 +706,37 @@ app.delete('/api/disconnect/:id', async (req, res) => {
     }
 });
 
+// 8b. Additional disconnect endpoint for Replit frontend compatibility
+app.delete('/api/accounts/:id', async (req, res) => {
+    try {
+        const sock = sessions.get(req.params.id);
+        if (sock) {
+            await sock.logout();
+            await sock.end();
+        }
+        sessions.delete(req.params.id);
+        sessionStates.delete(req.params.id);
+        sessionUserMap.delete(req.params.id);
+
+        await db.collection('whatsapp_accounts').doc(req.params.id).update({
+            status: 'disconnected',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Delete cloud session
+        try {
+            const [files] = await bucket.getFiles({ prefix: `sessions/${req.params.id}/` });
+            for (const file of files) await file.delete();
+        } catch (e) {
+            // ignore storage errors
+        }
+
+        res.json({ success: true, message: 'Device disconnected' });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // 9. SET DAILY LIMIT
 app.post('/api/limit/:id', async (req, res) => {
     const { limit } = req.body;
