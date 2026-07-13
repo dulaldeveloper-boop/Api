@@ -76,6 +76,31 @@ function jid(phone) {
 }
 
 // ============================================
+// PHONE VALIDATION & CLEANING HELPER
+// ============================================
+function validateAndCleanPhone(phone) {
+    // Remove all non-digit characters
+    let cleanPhone = String(phone).replace(/\D/g, '');
+    
+    // Remove leading 0 if present (common in local BD formats)
+    if (cleanPhone.startsWith('0')) {
+        cleanPhone = cleanPhone.slice(1);
+    }
+    
+    // Auto-add Bangladesh country code if missing
+    if (!cleanPhone.startsWith('880')) {
+        cleanPhone = '880' + cleanPhone;
+    }
+    
+    // Validate: must be 13 digits for BD (880 + 10 digits)
+    if (cleanPhone.length !== 13 || !cleanPhone.startsWith('880')) {
+        return { valid: false, error: 'Invalid BD phone. Use format: 8801XXXXXXXXX or 01XXXXXXXXX' };
+    }
+    
+    return { valid: true, phone: cleanPhone };
+}
+
+// ============================================
 // FIREBASE STORAGE SESSION SAVE/LOAD
 // ============================================
 async function saveSessionToCloud(sessionId) {
@@ -405,18 +430,23 @@ async function runCampaign(campaignId) {
 // API ENDPOINTS
 // ============================================
 
-// 1. PAIR - get pairing code (with duplicate check)
+// 1. PAIR - get pairing code (with improved phone validation)
 app.post('/api/pair', async (req, res) => {
     try {
         const { phone, userId } = req.body;
         if (!phone) return res.status(400).json({ success: false, error: 'Phone required' });
 
-        // ফোন নাম্বার ক্লিন করুন (শুধু ডিজিট)
-        const cleanPhone = String(phone).replace(/[\+\-\s\(\)]/g, '');
+        // Validate and clean phone number
+        const validation = validateAndCleanPhone(phone);
         
-        if (cleanPhone.length < 10) {
-            return res.status(400).json({ success: false, error: 'Invalid phone number' });
+        if (!validation.valid) {
+            return res.status(400).json({ 
+                success: false, 
+                error: validation.error 
+            });
         }
+
+        const cleanPhone = validation.phone;
 
         const sessionId = uuidv4();
         sessionStates.set(sessionId, { status: 'initializing', phone: cleanPhone, userId });
@@ -502,7 +532,7 @@ app.get('/api/status/:id', (req, res) => {
     });
 });
 
-// 4. SEND SINGLE MESSAGE (with success detection)
+// 4. SEND SINGLE MESSAGE (with improved phone validation)
 app.post('/api/send', async (req, res) => {
     try {
         const { accountId, to, text, userId } = req.body;
@@ -516,7 +546,12 @@ app.post('/api/send', async (req, res) => {
             });
         }
 
-        const jidTo = to.includes('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`;
+        // Validate recipient phone
+        let cleanTo = String(to).replace(/\D/g, '');
+        if (cleanTo.startsWith('0')) cleanTo = cleanTo.slice(1);
+        if (!cleanTo.startsWith('880')) cleanTo = '880' + cleanTo;
+        
+        const jidTo = `${cleanTo}@s.whatsapp.net`;
         const result = await sock.sendMessage(jidTo, { text });
 
         if (!result?.key?.id) {
@@ -608,15 +643,20 @@ app.post('/api/campaign/start', async (req, res) => {
 
         await campaignRef.set(campaignData);
 
-        // Store targets in subcollection
+        // Store targets in subcollection with validated phone numbers
         const BATCH_SIZE = 400;
         for (let i = 0; i < targets.length; i += BATCH_SIZE) {
             const batch = db.batch();
             const chunk = targets.slice(i, i + BATCH_SIZE);
             chunk.forEach((t, idx) => {
+                // Validate and clean each target phone
+                let cleanPhone = String(t.phone).replace(/\D/g, '');
+                if (cleanPhone.startsWith('0')) cleanPhone = cleanPhone.slice(1);
+                if (!cleanPhone.startsWith('880')) cleanPhone = '880' + cleanPhone;
+                
                 const targetRef = campaignRef.collection('targets').doc(String(i + idx));
                 batch.set(targetRef, {
-                    phone: formatPhone(t.phone),
+                    phone: cleanPhone,
                     name: t.name || '',
                     status: 'pending'
                 });
