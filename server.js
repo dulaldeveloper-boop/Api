@@ -410,50 +410,29 @@ app.post('/api/pair', async (req, res) => {
     try {
         const { phone, userId } = req.body;
         if (!phone) return res.status(400).json({ success: false, error: 'Phone required' });
-        if (!userId) return res.status(400).json({ success: false, error: 'User ID required' });
 
-        const cleanPhone = formatPhone(phone);
-
-        // 🔒 Check: Is this phone already connected by someone else?
-        const existingSnap = await db.collection('whatsapp_accounts')
-            .where('phone', '==', cleanPhone)
-            .where('status', '==', 'connected')
-            .get();
-
-        if (!existingSnap.empty) {
-            const existing = existingSnap.docs[0].data();
-            if (existing.userId !== userId) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'This WhatsApp number is already connected by another user.',
-                    connectedBy: existing.userId
-                });
-            }
-            // Same user - allow reconnect
-        }
-
-        // Check if this user already has a session for this phone
-        const userSessionSnap = await db.collection('whatsapp_accounts')
-            .where('phone', '==', cleanPhone)
-            .where('userId', '==', userId)
-            .where('status', '==', 'connected')
-            .get();
-
-        if (!userSessionSnap.empty) {
-            return res.status(400).json({
-                success: false,
-                error: 'You already have this number connected.',
-                sessionId: userSessionSnap.docs[0].id
-            });
+        // ফোন নাম্বার ক্লিন করুন (শুধু ডিজিট)
+        const cleanPhone = String(phone).replace(/[\+\-\s\(\)]/g, '');
+        
+        if (cleanPhone.length < 10) {
+            return res.status(400).json({ success: false, error: 'Invalid phone number' });
         }
 
         const sessionId = uuidv4();
         sessionStates.set(sessionId, { status: 'initializing', phone: cleanPhone, userId });
-        sessionUserMap.set(sessionId, userId);
 
+        // Baileys সেশন তৈরি
         const sock = await createSession(sessionId, cleanPhone, userId);
-        await delay(2000);
+        
+        // ৩ সেকেন্ড অপেক্ষা (সেশন রেডি হতে)
+        await delay(3000);
+        
+        // Pairing code জেনারেট
         const code = await sock.requestPairingCode(cleanPhone);
+        
+        if (!code) {
+            return res.status(400).json({ success: false, error: 'Failed to generate code. Try again.' });
+        }
 
         sessionStates.set(sessionId, {
             status: 'pair_ready',
@@ -478,7 +457,18 @@ app.post('/api/pair', async (req, res) => {
             sessionId,
             message: 'Enter this code in WhatsApp > Linked Devices'
         });
+
     } catch (err) {
+        console.error('Pair error:', err.message);
+        
+        // Error handle
+        if (err.message?.includes('child')) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Connection failed. Please try again with correct phone number format (8801XXXXXXXXX).' 
+            });
+        }
+        
         res.status(500).json({ success: false, error: err.message });
     }
 });
