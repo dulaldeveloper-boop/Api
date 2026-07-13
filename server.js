@@ -146,14 +146,13 @@ async function loadSessionFromCloud(sessionId) {
 }
 
 // ============================================
-// WHATSAPP SESSION CREATE
+// WHATSAPP SESSION CREATE (SIMPLIFIED)
 // ============================================
-async function createSession(sessionId, phoneNumber, userId) {
-    // Load session from cloud first
-    await loadSessionFromCloud(sessionId);
-
+async function createSession(sessionId, phoneNumber) {
     const authPath = `${SESSIONS_DIR}/${sessionId}`;
-    if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true });
+    if (!fs.existsSync(authPath)) {
+        fs.mkdirSync(authPath, { recursive: true });
+    }
 
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const { version } = await fetchLatestBaileysVersion();
@@ -166,6 +165,7 @@ async function createSession(sessionId, phoneNumber, userId) {
         logger: undefined
     });
 
+    // Connection handler
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
 
@@ -177,67 +177,76 @@ async function createSession(sessionId, phoneNumber, userId) {
                 status: 'connected',
                 phone,
                 name,
-                userId: userId,
                 connectedAt: new Date().toISOString()
             });
-            sessionUserMap.set(sessionId, userId);
 
             const stored = (await db.collection('whatsapp_accounts').doc(sessionId).get()).data();
             const limit = stored?.dailyLimit || 5;
             dailyLimits.set(sessionId, limit);
             todayCounts.set(sessionId, stored?.todaySent || 0);
 
-            await db.collection('whatsapp_accounts').doc(sessionId).set({
+            await db.collection('whatsapp_accounts').doc(sessionId).update({
                 phone,
                 name,
                 status: 'connected',
-                userId: userId,
                 dailyLimit: limit,
                 todaySent: todayCounts.get(sessionId) || 0,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
+            });
 
-            console.log(`✅ ${name} (${phone}) connected`);
-
-            // Save session to cloud
+            console.log(`✅ Connected: ${name} (${phone})`);
             await saveSessionToCloud(sessionId);
         }
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            if (isLoggedOut) {
-                // 🔴 LOGOUT DETECTED - Send notification
+            if (shouldReconnect) {
+                console.log(`🔄 Reconnecting ${sessionId}...`);
+                sessionStates.set(sessionId, {
+                    ...sessionStates.get(sessionId) || {},
+                    status: 'disconnected'
+                });
+                
+                await db.collection('whatsapp_accounts').doc(sessionId).update({
+                    status: 'disconnected',
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                
+                setTimeout(() => createSession(sessionId, phoneNumber), 5000);
+            } else {
                 console.log(`🔴 ${phoneNumber} LOGGED OUT!`);
+                sessions.delete(sessionId);
+                sessionStates.delete(sessionId);
 
-                // Update Firestore - status logged_out
                 await db.collection('whatsapp_accounts').doc(sessionId).update({
                     status: 'logged_out',
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // Send notification to user
-                const userSnap = await db.collection('users').doc(userId).get();
-                if (userSnap.exists) {
-                    await db.collection('notifications').add({
-                        userId: userId,
-                        type: 'account_logged_out',
-                        title: '⚠️ WhatsApp Account Logged Out',
-                        message: `Account ${phoneNumber} has been logged out from WhatsApp. Please reconnect.`,
-                        sessionId: sessionId,
-                        phone: phoneNumber,
-                        read: false,
-                        createdAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
+                // Notify user if userId is stored
+                const userId = sessionUserMap.get(sessionId);
+                if (userId) {
+                    try {
+                        await db.collection('notifications').add({
+                            userId: userId,
+                            type: 'account_logged_out',
+                            title: '⚠️ WhatsApp Account Logged Out',
+                            message: `Account ${phoneNumber} has been logged out from WhatsApp. Please reconnect.`,
+                            sessionId: sessionId,
+                            phone: phoneNumber,
+                            read: false,
+                            createdAt: admin.firestore.FieldValue.serverTimestamp()
+                        });
+                    } catch (e) {
+                        console.error('Notification error:', e.message);
+                    }
                 }
 
-                // Remove from memory
-                sessions.delete(sessionId);
-                sessionStates.delete(sessionId);
                 sessionUserMap.delete(sessionId);
 
-                // Delete session from cloud
+                // Delete cloud session
                 try {
                     const [files] = await bucket.getFiles({ prefix: `sessions/${sessionId}/` });
                     for (const file of files) {
@@ -246,31 +255,16 @@ async function createSession(sessionId, phoneNumber, userId) {
                 } catch (e) {
                     // ignore
                 }
-            } else {
-                // Disconnected but can reconnect
-                sessionStates.set(sessionId, {
-                    ...sessionStates.get(sessionId) || {},
-                    status: 'disconnected'
-                });
-
-                await db.collection('whatsapp_accounts').doc(sessionId).update({
-                    status: 'disconnected',
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                console.log(`🔄 ${phoneNumber} disconnected, attempting reconnect...`);
-                setTimeout(() => createSession(sessionId, phoneNumber, userId), 5000);
             }
         }
     });
 
-    // Save creds on update
+    // Save credentials
     sock.ev.on('creds.update', async () => {
         await saveCreds();
-        // Auto-save to cloud every creds update
         await saveSessionToCloud(sessionId);
     });
-
+    
     sessions.set(sessionId, sock);
     return sock;
 }
@@ -430,50 +424,59 @@ async function runCampaign(campaignId) {
 // API ENDPOINTS
 // ============================================
 
-// 1. PAIR - get pairing code (with improved phone validation)
+// 1. PAIR - get pairing code (IMPROVED)
 app.post('/api/pair', async (req, res) => {
     try {
-        const { phone, userId } = req.body;
-        if (!phone) return res.status(400).json({ success: false, error: 'Phone required' });
-
-        // Validate and clean phone number
-        const validation = validateAndCleanPhone(phone);
+        let { phone, userId } = req.body;
         
-        if (!validation.valid) {
+        if (!phone) {
+            return res.status(400).json({ success: false, error: 'Phone number required' });
+        }
+
+        // Clean phone - just digits
+        phone = phone.replace(/\D/g, '');
+        
+        if (phone.length < 10) {
+            return res.status(400).json({ success: false, error: 'Invalid phone number' });
+        }
+
+        const sessionId = uuidv4();
+        
+        sessionStates.set(sessionId, { 
+            status: 'initializing', 
+            phone: phone,
+            userId: userId || null 
+        });
+
+        // Create session
+        const sock = await createSession(sessionId, phone);
+        
+        // 2 seconds delay for session to initialize
+        await delay(2000);
+        
+        // Request pairing code
+        const code = await sock.requestPairingCode(phone);
+        
+        if (!code) {
             return res.status(400).json({ 
                 success: false, 
-                error: validation.error 
+                error: 'Failed to generate pairing code. Try again.' 
             });
         }
 
-        const cleanPhone = validation.phone;
-
-        const sessionId = uuidv4();
-        sessionStates.set(sessionId, { status: 'initializing', phone: cleanPhone, userId });
-
-        // Baileys সেশন তৈরি
-        const sock = await createSession(sessionId, cleanPhone, userId);
-        
-        // ৩ সেকেন্ড অপেক্ষা (সেশন রেডি হতে)
-        await delay(3000);
-        
-        // Pairing code জেনারেট
-        const code = await sock.requestPairingCode(cleanPhone);
-        
-        if (!code) {
-            return res.status(400).json({ success: false, error: 'Failed to generate code. Try again.' });
-        }
+        console.log(`🔑 Pairing Code: ${code} for ${phone}`);
 
         sessionStates.set(sessionId, {
             status: 'pair_ready',
             pairCode: code,
-            phone: cleanPhone,
-            userId: userId
+            phone: phone,
+            userId: userId || null
         });
 
+        // Save to Firestore
         await db.collection('whatsapp_accounts').doc(sessionId).set({
-            userId: userId,
-            phone: cleanPhone,
+            userId: userId || '',
+            phone: phone,
             status: 'pair_ready',
             pairCode: code,
             dailyLimit: 5,
@@ -483,23 +486,18 @@ app.post('/api/pair', async (req, res) => {
 
         res.json({
             success: true,
-            code,
-            sessionId,
-            message: 'Enter this code in WhatsApp > Linked Devices'
+            code: code,
+            sessionId: sessionId,
+            phone: phone,
+            message: 'Enter this code in WhatsApp > Linked Devices > Link Device'
         });
 
     } catch (err) {
-        console.error('Pair error:', err.message);
-        
-        // Error handle
-        if (err.message?.includes('child')) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Connection failed. Please try again with correct phone number format (8801XXXXXXXXX).' 
-            });
-        }
-        
-        res.status(500).json({ success: false, error: err.message });
+        console.error('❌ Pair error:', err.message);
+        res.status(400).json({ 
+            success: false, 
+            error: err.message || 'Connection failed. Try again.' 
+        });
     }
 });
 
@@ -532,7 +530,7 @@ app.get('/api/status/:id', (req, res) => {
     });
 });
 
-// 4. SEND SINGLE MESSAGE (with improved phone validation)
+// 4. SEND SINGLE MESSAGE
 app.post('/api/send', async (req, res) => {
     try {
         const { accountId, to, text, userId } = req.body;
@@ -846,8 +844,10 @@ async function loadAllSessions() {
 
             if (loaded) {
                 console.log(`📂 Restoring session: ${data.phone}`);
-                sessionUserMap.set(sessionId, data.userId);
-                await createSession(sessionId, data.phone, data.userId);
+                if (data.userId) {
+                    sessionUserMap.set(sessionId, data.userId);
+                }
+                await createSession(sessionId, data.phone);
                 await delay(2000);
             }
         }
