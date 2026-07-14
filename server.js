@@ -1,6 +1,6 @@
 // ============================================
 // WS-INCOME WhatsApp Campaign Engine v2.2
-// Firebase Storage Session | Real-time | Anti-Duplicate | Error Resilient
+// Firebase Firestore Session | Real-time | Anti-Duplicate | Error Resilient
 // ============================================
 
 const express = require('express');
@@ -43,17 +43,15 @@ const logger = pino({
 // ============================================
 // FIREBASE INIT
 // ============================================
-let db, bucket;
+let db;
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
-        databaseURL: process.env.FIREBASE_DB_URL,
-        storageBucket: "ws-income-official.firebasestorage.app"
+        databaseURL: process.env.FIREBASE_DB_URL
     });
     db = admin.firestore();
-    bucket = admin.storage().bucket();
-    console.log('🔥 Firestore + Storage Connected');
+    console.log('🔥 Firestore Connected');
 } catch (err) {
     console.error('❌ Firebase init failed:', err.message);
     process.exit(1);
@@ -152,44 +150,55 @@ function validateAndCleanPhone(phone) {
 }
 
 // ============================================
-// FIREBASE STORAGE SESSION SAVE/LOAD
+// FIREBASE FIRESTORE SESSION SAVE/LOAD
 // ============================================
-async function saveSessionToCloud(sessionId) {
+async function saveSessionToFirestore(sessionId) {
     try {
         const sessionPath = `${SESSIONS_DIR}/${sessionId}`;
         if (!fs.existsSync(sessionPath)) return;
 
         const files = fs.readdirSync(sessionPath);
+        const sessionData = {};
+        
         for (const file of files) {
             const filePath = `${sessionPath}/${file}`;
             if (fs.statSync(filePath).isFile()) {
-                await bucket.upload(filePath, {
-                    destination: `sessions/${sessionId}/${file}`,
-                    metadata: { contentType: 'application/octet-stream' }
-                });
+                const content = fs.readFileSync(filePath, 'utf-8');
+                sessionData[file] = content;
             }
         }
+        
+        // Firestore-এ সেভ (1MB limit per doc, সেশন ছোট হয়)
+        await db.collection('session_data').doc(sessionId).set({
+            data: sessionData,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        
+        logger.info({ sessionId }, '💾 Session saved to Firestore');
     } catch (err) {
         logger.error({ sessionId, err }, '💾 Session save error');
     }
 }
 
-async function loadSessionFromCloud(sessionId) {
+async function loadSessionFromFirestore(sessionId) {
     try {
         const sessionPath = `${SESSIONS_DIR}/${sessionId}`;
         if (!fs.existsSync(sessionPath)) {
             fs.mkdirSync(sessionPath, { recursive: true });
         }
 
-        const [files] = await bucket.getFiles({ prefix: `sessions/${sessionId}/` });
-        for (const file of files) {
-            const fileName = path.basename(file.name);
+        const doc = await db.collection('session_data').doc(sessionId).get();
+        if (!doc.exists) return false;
+
+        const sessionData = doc.data().data || {};
+        
+        for (const [fileName, content] of Object.entries(sessionData)) {
             const destPath = `${sessionPath}/${fileName}`;
-            if (!fs.existsSync(destPath)) {
-                await file.download({ destination: destPath });
-            }
+            fs.writeFileSync(destPath, content);
         }
-        return files.length > 0;
+        
+        logger.info({ sessionId }, '📂 Session loaded from Firestore');
+        return true;
     } catch (err) {
         logger.error({ sessionId, err }, '📥 Session load error');
         return false;
@@ -250,7 +259,7 @@ async function createSession(sessionId, phoneNumber) {
                     });
 
                     console.log(`✅ Connected: ${name} (${phone})`);
-                    await saveSessionToCloud(sessionId);
+                    await saveSessionToFirestore(sessionId);
                 }
 
                 if (connection === 'close') {
@@ -301,14 +310,12 @@ async function createSession(sessionId, phoneNumber) {
 
                         sessionUserMap.delete(sessionId);
 
-                        // Delete cloud session
+                        // Delete Firestore session
                         try {
-                            const [files] = await bucket.getFiles({ prefix: `sessions/${sessionId}/` });
-                            for (const file of files) {
-                                await file.delete();
-                            }
+                            await db.collection('session_data').doc(sessionId).delete();
+                            logger.info({ sessionId }, '🗑️ Session data deleted from Firestore');
                         } catch (e) {
-                            logger.warn({ sessionId }, 'Cloud session cleanup failed');
+                            logger.warn({ sessionId }, 'Session cleanup failed');
                         }
                     }
                 }
@@ -321,7 +328,7 @@ async function createSession(sessionId, phoneNumber) {
         sock.ev.on('creds.update', async () => {
             try {
                 await saveCreds();
-                await saveSessionToCloud(sessionId);
+                await saveSessionToFirestore(sessionId);
             } catch (err) {
                 logger.error({ sessionId, err }, 'Credential save error');
             }
@@ -877,12 +884,12 @@ app.delete('/api/disconnect/:id', async (req, res) => {
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Delete cloud session
+        // Delete Firestore session
         try {
-            const [files] = await bucket.getFiles({ prefix: `sessions/${req.params.id}/` });
-            for (const file of files) await file.delete();
+            await db.collection('session_data').doc(req.params.id).delete();
+            logger.info({ sessionId: req.params.id }, '🗑️ Session data deleted from Firestore');
         } catch (e) {
-            logger.warn({ sessionId: req.params.id }, 'Cloud session cleanup failed');
+            logger.warn({ sessionId: req.params.id }, 'Session cleanup failed');
         }
 
         res.json({ success: true });
@@ -909,12 +916,12 @@ app.delete('/api/accounts/:id', async (req, res) => {
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Delete cloud session
+        // Delete Firestore session
         try {
-            const [files] = await bucket.getFiles({ prefix: `sessions/${req.params.id}/` });
-            for (const file of files) await file.delete();
+            await db.collection('session_data').doc(req.params.id).delete();
+            logger.info({ sessionId: req.params.id }, '🗑️ Session data deleted from Firestore');
         } catch (e) {
-            logger.warn({ sessionId: req.params.id }, 'Cloud session cleanup failed');
+            logger.warn({ sessionId: req.params.id }, 'Session cleanup failed');
         }
 
         res.json({ success: true, message: 'Device disconnected' });
@@ -1017,10 +1024,10 @@ setInterval(async () => {
     try {
         for (const sessionId of sessions.keys()) {
             if (sessionStates.get(sessionId)?.status === 'connected') {
-                await saveSessionToCloud(sessionId);
+                await saveSessionToFirestore(sessionId);
             }
         }
-        console.log('💾 Sessions auto-saved to cloud');
+        console.log('💾 Sessions auto-saved to Firestore');
     } catch (err) {
         logger.error({ err }, 'Auto-save sessions error');
     }
@@ -1038,7 +1045,7 @@ async function loadAllSessions() {
         for (const doc of snap.docs) {
             const data = doc.data();
             const sessionId = doc.id;
-            const loaded = await loadSessionFromCloud(sessionId);
+            const loaded = await loadSessionFromFirestore(sessionId);
 
             if (loaded) {
                 console.log(`📂 Restoring session: ${data.phone}`);
@@ -1078,6 +1085,6 @@ app.use((err, req, res, next) => {
 // ============================================
 app.listen(PORT, async () => {
     console.log(`🚀 WS-Income Engine v2.2 on port ${PORT}`);
-    console.log(`📡 Firebase Storage Sessions | Anti-Duplicate | Error Resilient`);
+    console.log(`📡 Firebase Firestore Sessions | Anti-Duplicate | Error Resilient`);
     await loadAllSessions();
 });
