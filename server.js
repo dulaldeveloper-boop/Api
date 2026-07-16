@@ -382,6 +382,9 @@ async function checkAndRunCampaigns(userId) {
 // ============================================
 // ✅ CAMPAIGN ENGINE v3.0 (Realtime DB)
 // ============================================
+// ============================================
+// ✅ CAMPAIGN ENGINE v3.1 (Join Check + Anti-Ban Delay + Progress)
+// ============================================
 async function runCampaign(campaignId) {
     if (activeCampaigns.has(campaignId)) {
         logger.info({ campaignId }, 'Campaign already running');
@@ -424,28 +427,63 @@ async function runCampaign(campaignId) {
             return;
         }
 
-        // Get available accounts
-        const accountsSnap = await db.ref('whatsapp_accounts')
-            .orderByChild('userId')
-            .equalTo(userId)
+        // ✅ JOIN CHECK: শুধু Join করা users-দের account নাও
+        const progressSnap = await db.ref('campaign_progress')
+            .orderByChild('campaignId')
+            .equalTo(campaignId)
             .once('value');
 
-        const availableAccounts = [];
-        accountsSnap.forEach((child) => {
-            const data = child.val();
-            const accId = child.key;
-            const todaySent = todayCounts.get(accId) || data.todaySent || 0;
-            const dailyLimit = dailyLimits.get(accId) || data.dailyLimit || 5;
-            if (data.status === 'connected' && todaySent < dailyLimit && sessions.has(accId)) {
-                availableAccounts.push({ id: accId, todaySent, dailyLimit });
-            }
-        });
+        const joinedAccounts = [];
+        if (progressSnap.exists()) {
+            progressSnap.forEach((child) => {
+                const prog = child.val();
+                if (prog.status === 'active' && prog.accountId) {
+                    joinedAccounts.push({ 
+                        id: prog.accountId, 
+                        progressKey: child.key,
+                        todaySent: 0, 
+                        dailyLimit: 5 
+                    });
+                }
+            });
+        }
 
-        if (availableAccounts.length === 0) {
-            logger.info({ campaignId }, '⏸️ No available accounts, pausing');
+        if (joinedAccounts.length === 0) {
+            logger.info({ campaignId }, '⏸️ No joined accounts available, pausing');
+            await db.ref('campaigns/' + campaignId).update({ 
+                status: 'paused',
+                pausedReason: 'No joined accounts'
+            });
             activeCampaigns.delete(campaignId);
             return;
         }
+
+        // Get full account details for joined accounts
+        const availableAccounts = [];
+        for (const acc of joinedAccounts) {
+            const deviceSnap = await db.ref('whatsapp_accounts/' + acc.id).once('value');
+            const device = deviceSnap.val();
+            if (device && device.status === 'connected' && sessions.has(acc.id)) {
+                const todaySent = todayCounts.get(acc.id) || device.todaySent || 0;
+                const dailyLimit = dailyLimits.get(acc.id) || device.dailyLimit || 5;
+                if (todaySent < dailyLimit) {
+                    availableAccounts.push({ 
+                        id: acc.id, 
+                        progressKey: acc.progressKey, 
+                        todaySent, 
+                        dailyLimit 
+                    });
+                }
+            }
+        }
+
+        if (availableAccounts.length === 0) {
+            logger.info({ campaignId }, '⏸️ No available devices (all offline or limit reached)');
+            activeCampaigns.delete(campaignId);
+            return;
+        }
+
+        logger.info({ campaignId, joinedCount: joinedAccounts.length, availableCount: availableAccounts.length }, '▶️ Campaign running');
 
         let accountIndex = 0;
         const targets = [];
@@ -478,7 +516,9 @@ async function runCampaign(campaignId) {
 
             try {
                 const jidTarget = jid(target.phone);
-                const msg = messageTemplate.replace(/\{name\}/g, target.name || '');
+                const msg = messageTemplate
+                    .replace(/\{name\}/g, target.name || '')
+                    .replace(/\{phone\}/g, target.phone || '');
                 
                 const result = await sock.sendMessage(jidTarget, { text: msg });
 
@@ -506,7 +546,7 @@ async function runCampaign(campaignId) {
                     });
 
                     // Update user balance
-                    if (campaign.pricePerMessage > 0) {
+                    if (campaign.pricePerMessage > 0 && userId) {
                         const userSnap = await db.ref('users/' + userId).once('value');
                         const userData = userSnap.val() || {};
                         await db.ref('users/' + userId).update({
@@ -516,20 +556,14 @@ async function runCampaign(campaignId) {
                         });
                     }
 
-                    // Update campaign progress
-                    const progressSnap = await db.ref('campaign_progress/' + userId + '_' + campaignId).once('value');
-                    const progress = progressSnap.val() || {};
-                    await db.ref('campaign_progress/' + userId + '_' + campaignId).set({
-                        userId: userId,
-                        campaignId: campaignId,
-                        campaignName: campaign.name,
-                        accountId: account.id,
-                        pricePerMessage: campaign.pricePerMessage || 0,
-                        sentCount: (progress.sentCount || 0) + 1,
-                        earned: (progress.earned || 0) + (campaign.pricePerMessage || 0),
-                        status: 'active',
-                        updatedAt: admin.database.ServerValue.TIMESTAMP
-                    });
+                    // ✅ Update campaign_progress for this user
+                    if (account.progressKey) {
+                        await db.ref('campaign_progress/' + account.progressKey).update({
+                            sentCount: admin.database.ServerValue.increment(1),
+                            earned: admin.database.ServerValue.increment(campaign.pricePerMessage || 0),
+                            updatedAt: admin.database.ServerValue.TIMESTAMP
+                        });
+                    }
 
                     console.log(`✅ [${account.id}] Sent to ${target.phone} (${newSentCount}/${campaign.totalTargets})`);
                 } else {
@@ -563,15 +597,15 @@ async function runCampaign(campaignId) {
                     sessions.delete(account.id);
                     sessionStates.delete(account.id);
                     
-                    const userId = sessionUserMap.get(account.id);
                     if (userId) await updateUserDeviceStats(userId);
                 }
             }
 
             accountIndex++;
             
-            // Random delay 10-30 seconds
-            const randomDelay = Math.floor(Math.random() * 20000) + 10000;
+            // ✅ RANDOM DELAY 20-60 seconds (Anti-Ban)
+            const randomDelay = Math.floor(Math.random() * 40000) + 20000;
+            logger.info({ campaignId, delay: (randomDelay/1000).toFixed(1) }, '⏳ Waiting before next message');
             await delay(randomDelay);
         }
 
@@ -590,14 +624,16 @@ async function runCampaign(campaignId) {
             logger.info({ campaignId }, '🎉 Campaign completed!');
             
             // Notify user
-            await db.ref('notifications').push().set({
-                userId: userId,
-                type: 'campaign_completed',
-                title: '🎉 Campaign Completed!',
-                message: `Campaign "${campaign.name}" has been completed. ${campaign.sentCount} messages sent.`,
-                read: false,
-                createdAt: admin.database.ServerValue.TIMESTAMP
-            });
+            if (userId) {
+                await db.ref('notifications').push().set({
+                    userId: userId,
+                    type: 'campaign_completed',
+                    title: '🎉 Campaign Completed!',
+                    message: `Campaign "${campaign.name}" has been completed. ${campaign.sentCount} messages sent.`,
+                    read: false,
+                    createdAt: admin.database.ServerValue.TIMESTAMP
+                });
+            }
         }
     } catch (err) {
         logger.error({ campaignId, err }, '❌ Campaign error');
