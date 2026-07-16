@@ -1,6 +1,6 @@
 // ============================================
-// WS-INCOME WhatsApp Campaign Engine v2.2
-// Firebase Firestore Session | Real-time | Anti-Duplicate | Error Resilient
+// WS-INCOME WhatsApp Campaign Engine v3.0
+// Firebase Realtime Database | Real-time | Anti-Duplicate | Error Resilient
 // ============================================
 
 const express = require('express');
@@ -41,17 +41,17 @@ const logger = pino({
 });
 
 // ============================================
-// FIREBASE INIT
+// ✅ FIREBASE REALTIME DATABASE INIT
 // ============================================
 let db;
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
-        databaseURL: process.env.FIREBASE_DB_URL
+        databaseURL: process.env.FIREBASE_DB_URL || "https://ws-income-official-default-rtdb.asia-southeast1.firebasedatabase.app"
     });
-    db = admin.firestore();
-    console.log('🔥 Firestore Connected');
+    db = admin.database();
+    console.log('🔥 Realtime Database Connected');
 } catch (err) {
     console.error('❌ Firebase init failed:', err.message);
     process.exit(1);
@@ -60,12 +60,14 @@ try {
 // ============================================
 // GLOBALS
 // ============================================
-const sessions = new Map();              // sock instances
-const sessionStates = new Map();         // current state per session
-const todayCounts = new Map();           // todaySent per session
-const dailyLimits = new Map();           // per session
-const sessionUserMap = new Map();        // sessionId → userId
-const campaignListeners = new Map();    // unsubscribe functions for campaigns
+const sessions = new Map();
+const sessionStates = new Map();
+const todayCounts = new Map();
+const dailyLimits = new Map();
+const sessionUserMap = new Map();
+const campaignListeners = new Map();
+const campaignQueues = new Map(); // Campaign message queues
+const activeCampaigns = new Map(); // Currently running campaigns
 
 // ============================================
 // EXPRESS SETUP
@@ -80,13 +82,12 @@ if (!fs.existsSync(SESSIONS_DIR)) {
 }
 
 // ============================================
-// MIDDLEWARE - REQUEST VALIDATION
+// MIDDLEWARE
 // ============================================
 function validateUserId(req, res, next) {
     const methods = req.method.toUpperCase();
     const path = req.path;
     
-    // Routes requiring userId validation
     const protectedRoutes = [
         { method: 'POST', pattern: /^\/api\/send$/ },
         { method: 'POST', pattern: /^\/api\/campaign\/start$/ },
@@ -124,35 +125,14 @@ function jid(phone) {
     return `${phone}@s.whatsapp.net`;
 }
 
-// ============================================
-// PHONE VALIDATION & CLEANING HELPER
-// ============================================
-function validateAndCleanPhone(phone) {
-    // Remove all non-digit characters
-    let cleanPhone = String(phone).replace(/\D/g, '');
-    
-    // Remove leading 0 if present (common in local BD formats)
-    if (cleanPhone.startsWith('0')) {
-        cleanPhone = cleanPhone.slice(1);
-    }
-    
-    // Auto-add Bangladesh country code if missing
-    if (!cleanPhone.startsWith('880')) {
-        cleanPhone = '880' + cleanPhone;
-    }
-    
-    // Validate: must be 13 digits for BD (880 + 10 digits)
-    if (cleanPhone.length !== 13 || !cleanPhone.startsWith('880')) {
-        return { valid: false, error: 'Invalid BD phone. Use format: 8801XXXXXXXXX or 01XXXXXXXXX' };
-    }
-    
-    return { valid: true, phone: cleanPhone };
+function generateId() {
+    return uuidv4().replace(/-/g, '').substring(0, 20);
 }
 
 // ============================================
-// FIREBASE FIRESTORE SESSION SAVE/LOAD
+// ✅ REALTIME DB SESSION SAVE/LOAD
 // ============================================
-async function saveSessionToFirestore(sessionId) {
+async function saveSessionToDB(sessionId) {
     try {
         const sessionPath = `${SESSIONS_DIR}/${sessionId}`;
         if (!fs.existsSync(sessionPath)) return;
@@ -168,36 +148,35 @@ async function saveSessionToFirestore(sessionId) {
             }
         }
         
-        // Firestore-এ সেভ (1MB limit per doc, সেশন ছোট হয়)
-        await db.collection('session_data').doc(sessionId).set({
+        await db.ref('session_data/' + sessionId).set({
             data: sessionData,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
+            updatedAt: admin.database.ServerValue.TIMESTAMP
+        });
         
-        logger.info({ sessionId }, '💾 Session saved to Firestore');
+        logger.info({ sessionId }, '💾 Session saved to Realtime DB');
     } catch (err) {
         logger.error({ sessionId, err }, '💾 Session save error');
     }
 }
 
-async function loadSessionFromFirestore(sessionId) {
+async function loadSessionFromDB(sessionId) {
     try {
         const sessionPath = `${SESSIONS_DIR}/${sessionId}`;
         if (!fs.existsSync(sessionPath)) {
             fs.mkdirSync(sessionPath, { recursive: true });
         }
 
-        const doc = await db.collection('session_data').doc(sessionId).get();
-        if (!doc.exists) return false;
+        const snap = await db.ref('session_data/' + sessionId).once('value');
+        if (!snap.exists()) return false;
 
-        const sessionData = doc.data().data || {};
+        const sessionData = snap.val().data || {};
         
         for (const [fileName, content] of Object.entries(sessionData)) {
             const destPath = `${sessionPath}/${fileName}`;
             fs.writeFileSync(destPath, content);
         }
         
-        logger.info({ sessionId }, '📂 Session loaded from Firestore');
+        logger.info({ sessionId }, '📂 Session loaded from Realtime DB');
         return true;
     } catch (err) {
         logger.error({ sessionId, err }, '📥 Session load error');
@@ -228,7 +207,6 @@ async function createSession(sessionId, phoneNumber) {
             logger: waLogger
         });
 
-        // Connection handler
         sock.ev.on('connection.update', async (update) => {
             try {
                 const { connection, lastDisconnect } = update;
@@ -244,22 +222,34 @@ async function createSession(sessionId, phoneNumber) {
                         connectedAt: new Date().toISOString()
                     });
 
-                    const stored = (await db.collection('whatsapp_accounts').doc(sessionId).get()).data();
-                    const limit = stored?.dailyLimit || 5;
+                    const storedSnap = await db.ref('whatsapp_accounts/' + sessionId).once('value');
+                    const stored = storedSnap.val() || {};
+                    const limit = stored.dailyLimit || 5;
                     dailyLimits.set(sessionId, limit);
-                    todayCounts.set(sessionId, stored?.todaySent || 0);
+                    todayCounts.set(sessionId, stored.todaySent || 0);
 
-                    await db.collection('whatsapp_accounts').doc(sessionId).update({
+                    await db.ref('whatsapp_accounts/' + sessionId).update({
                         phone,
                         name,
                         status: 'connected',
                         dailyLimit: limit,
                         todaySent: todayCounts.get(sessionId) || 0,
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
+                    // Update user stats
+                    const userId = sessionUserMap.get(sessionId) || stored.userId;
+                    if (userId) {
+                        await updateUserDeviceStats(userId);
+                    }
+
                     console.log(`✅ Connected: ${name} (${phone})`);
-                    await saveSessionToFirestore(sessionId);
+                    await saveSessionToDB(sessionId);
+                    
+                    // Check for pending campaigns
+                    if (userId) {
+                        checkAndRunCampaigns(userId);
+                    }
                 }
 
                 if (connection === 'close') {
@@ -270,12 +260,12 @@ async function createSession(sessionId, phoneNumber) {
                         console.log(`🔄 Reconnecting ${sessionId}...`);
                         sessionStates.set(sessionId, {
                             ...sessionStates.get(sessionId) || {},
-                            status: 'disconnected'
+                            status: 'reconnecting'
                         });
                         
-                        await db.collection('whatsapp_accounts').doc(sessionId).update({
-                            status: 'disconnected',
-                            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        await db.ref('whatsapp_accounts/' + sessionId).update({
+                            status: 'reconnecting',
+                            updatedAt: admin.database.ServerValue.TIMESTAMP
                         });
                         
                         setTimeout(() => createSession(sessionId, phoneNumber), 5000);
@@ -284,36 +274,33 @@ async function createSession(sessionId, phoneNumber) {
                         sessions.delete(sessionId);
                         sessionStates.delete(sessionId);
 
-                        await db.collection('whatsapp_accounts').doc(sessionId).update({
+                        await db.ref('whatsapp_accounts/' + sessionId).update({
                             status: 'logged_out',
-                            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                            updatedAt: admin.database.ServerValue.TIMESTAMP
                         });
 
-                        // Notify user if userId is stored
                         const userId = sessionUserMap.get(sessionId);
                         if (userId) {
-                            try {
-                                await db.collection('notifications').add({
-                                    userId: userId,
-                                    type: 'account_logged_out',
-                                    title: '⚠️ WhatsApp Account Logged Out',
-                                    message: `Account ${phoneNumber} has been logged out from WhatsApp. Please reconnect.`,
-                                    sessionId: sessionId,
-                                    phone: phoneNumber,
-                                    read: false,
-                                    createdAt: admin.firestore.FieldValue.serverTimestamp()
-                                });
-                            } catch (e) {
-                                logger.error({ sessionId, userId, err: e }, 'Notification error');
-                            }
+                            await updateUserDeviceStats(userId);
+                            
+                            const notifRef = db.ref('notifications').push();
+                            await notifRef.set({
+                                userId: userId,
+                                type: 'account_logged_out',
+                                title: '⚠️ WhatsApp Account Logged Out',
+                                message: `Account ${phoneNumber} has been logged out. Please reconnect.`,
+                                sessionId: sessionId,
+                                phone: phoneNumber,
+                                read: false,
+                                createdAt: admin.database.ServerValue.TIMESTAMP
+                            });
                         }
 
                         sessionUserMap.delete(sessionId);
 
-                        // Delete Firestore session
                         try {
-                            await db.collection('session_data').doc(sessionId).delete();
-                            logger.info({ sessionId }, '🗑️ Session data deleted from Firestore');
+                            await db.ref('session_data/' + sessionId).remove();
+                            logger.info({ sessionId }, '🗑️ Session data deleted');
                         } catch (e) {
                             logger.warn({ sessionId }, 'Session cleanup failed');
                         }
@@ -324,11 +311,10 @@ async function createSession(sessionId, phoneNumber) {
             }
         });
 
-        // Save credentials
         sock.ev.on('creds.update', async () => {
             try {
                 await saveCreds();
-                await saveSessionToFirestore(sessionId);
+                await saveSessionToDB(sessionId);
             } catch (err) {
                 logger.error({ sessionId, err }, 'Credential save error');
             }
@@ -343,71 +329,138 @@ async function createSession(sessionId, phoneNumber) {
 }
 
 // ============================================
-// CAMPAIGN ENGINE (with success/fail tracking & error boundary)
+// ✅ UPDATE USER DEVICE STATS
+// ============================================
+async function updateUserDeviceStats(userId) {
+    try {
+        const accountsSnap = await db.ref('whatsapp_accounts')
+            .orderByChild('userId')
+            .equalTo(userId)
+            .once('value');
+        
+        let total = 0, online = 0, offline = 0;
+        accountsSnap.forEach((child) => {
+            total++;
+            const acc = child.val();
+            if (acc.status === 'connected') online++;
+            else if (acc.status === 'logged_out' || acc.status === 'disconnected') offline++;
+        });
+        
+        await db.ref('users/' + userId).update({
+            totalAccounts: total,
+            onlineAccounts: online,
+            offlineAccounts: offline,
+            updatedAt: admin.database.ServerValue.TIMESTAMP
+        });
+    } catch (err) {
+        logger.error({ userId, err }, 'Update user stats error');
+    }
+}
+
+// ============================================
+// ✅ CHECK AND RUN CAMPAIGNS FOR USER
+// ============================================
+async function checkAndRunCampaigns(userId) {
+    try {
+        const campaignsSnap = await db.ref('campaigns')
+            .orderByChild('userId')
+            .equalTo(userId)
+            .once('value');
+        
+        campaignsSnap.forEach((child) => {
+            const campaign = child.val();
+            if (campaign.status === 'running' && !activeCampaigns.has(child.key)) {
+                logger.info({ campaignId: child.key }, '▶️ Auto-starting campaign');
+                runCampaign(child.key);
+            }
+        });
+    } catch (err) {
+        logger.error({ userId, err }, 'Check campaigns error');
+    }
+}
+
+// ============================================
+// ✅ CAMPAIGN ENGINE v3.0 (Realtime DB)
 // ============================================
 async function runCampaign(campaignId) {
+    if (activeCampaigns.has(campaignId)) {
+        logger.info({ campaignId }, 'Campaign already running');
+        return;
+    }
+    
+    activeCampaigns.set(campaignId, true);
+    
     try {
-        const campaignRef = db.collection('campaigns').doc(campaignId);
-        const campaignSnap = await campaignRef.get();
-        if (!campaignSnap.exists) {
-            logger.warn({ campaignId }, 'Campaign not found');
+        const campaignSnap = await db.ref('campaigns/' + campaignId).once('value');
+        if (!campaignSnap.exists()) {
+            activeCampaigns.delete(campaignId);
             return;
         }
 
-        const campaign = campaignSnap.data();
+        const campaign = campaignSnap.val();
         if (campaign.status !== 'running') {
-            logger.info({ campaignId, status: campaign.status }, 'Campaign not in running state');
+            logger.info({ campaignId, status: campaign.status }, 'Campaign not running');
+            activeCampaigns.delete(campaignId);
             return;
         }
 
         const userId = campaign.userId;
         const messageTemplate = campaign.message;
+        
+        // Get targets from campaign_targets
+        const targetsSnap = await db.ref('campaign_targets/' + campaignId)
+            .orderByChild('status')
+            .equalTo('pending')
+            .limitToFirst(50)
+            .once('value');
 
-        // Get pending targets from subcollection
-        const targetsSnap = await campaignRef.collection('targets')
-            .where('status', '==', 'pending')
-            .limit(50)
-            .get();
-
-        if (targetsSnap.empty) {
-            await campaignRef.update({ 
+        if (!targetsSnap.exists()) {
+            await db.ref('campaigns/' + campaignId).update({ 
                 status: 'completed',
-                completedAt: admin.firestore.FieldValue.serverTimestamp()
+                completedAt: admin.database.ServerValue.TIMESTAMP
             });
-            logger.info({ campaignId }, 'Campaign completed - no pending targets');
+            activeCampaigns.delete(campaignId);
+            logger.info({ campaignId }, '✅ Campaign completed');
             return;
         }
 
-        // Get available accounts for this user
-        const accountsSnap = await db.collection('whatsapp_accounts')
-            .where('userId', '==', userId)
-            .where('status', '==', 'connected')
-            .get();
+        // Get available accounts
+        const accountsSnap = await db.ref('whatsapp_accounts')
+            .orderByChild('userId')
+            .equalTo(userId)
+            .once('value');
 
         const availableAccounts = [];
-        accountsSnap.forEach(doc => {
-            const data = doc.data();
-            const todaySent = todayCounts.get(doc.id) || data.todaySent || 0;
-            const dailyLimit = dailyLimits.get(doc.id) || data.dailyLimit || 5;
-            if (todaySent < dailyLimit && sessions.has(doc.id)) {
-                availableAccounts.push({ id: doc.id, todaySent, dailyLimit });
+        accountsSnap.forEach((child) => {
+            const data = child.val();
+            const accId = child.key;
+            const todaySent = todayCounts.get(accId) || data.todaySent || 0;
+            const dailyLimit = dailyLimits.get(accId) || data.dailyLimit || 5;
+            if (data.status === 'connected' && todaySent < dailyLimit && sessions.has(accId)) {
+                availableAccounts.push({ id: accId, todaySent, dailyLimit });
             }
         });
 
         if (availableAccounts.length === 0) {
-            logger.info({ campaignId }, '⏸️ Campaign paused: No available accounts');
+            logger.info({ campaignId }, '⏸️ No available accounts, pausing');
+            activeCampaigns.delete(campaignId);
             return;
         }
 
         let accountIndex = 0;
-        for (const targetDoc of targetsSnap.docs) {
-            const currentSnap = await campaignRef.get();
-            if (currentSnap.data()?.status !== 'running') {
-                logger.info({ campaignId }, 'Campaign interrupted');
+        const targets = [];
+        targetsSnap.forEach((child) => {
+            targets.push({ id: child.key, ...child.val() });
+        });
+
+        for (const target of targets) {
+            // Check campaign status
+            const currentSnap = await db.ref('campaigns/' + campaignId).once('value');
+            if (!currentSnap.exists() || currentSnap.val().status !== 'running') {
+                logger.info({ campaignId }, 'Campaign stopped');
                 break;
             }
 
-            const target = targetDoc.data();
             const account = availableAccounts[accountIndex % availableAccounts.length];
             const sock = sessions.get(account.id);
 
@@ -416,125 +469,172 @@ async function runCampaign(campaignId) {
                 continue;
             }
 
-            try {
-                // Atomic increment check to prevent race conditions
-                const accountDoc = await db.collection('whatsapp_accounts').doc(account.id).get();
-                const currentCount = accountDoc.data()?.todaySent || 0;
-                
-                if (currentCount >= (dailyLimits.get(account.id) || 5)) {
-                    logger.info({ accountId: account.id, campaignId }, 'Account hit daily limit');
-                    accountIndex++;
-                    continue;
-                }
+            // Check daily limit
+            const currentCount = todayCounts.get(account.id) || 0;
+            if (currentCount >= (dailyLimits.get(account.id) || 5)) {
+                accountIndex++;
+                continue;
+            }
 
+            try {
                 const jidTarget = jid(target.phone);
                 const msg = messageTemplate.replace(/\{name\}/g, target.name || '');
                 
-                // 📤 Send message
                 const result = await sock.sendMessage(jidTarget, { text: msg });
 
                 if (result?.key?.id) {
                     // ✅ SUCCESS
-                    await targetDoc.ref.update({
+                    await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                         status: 'sent',
-                        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-                        messageId: result.key.id
+                        sentAt: admin.database.ServerValue.TIMESTAMP,
+                        messageId: result.key.id,
+                        sentBy: account.id
                     });
 
-                    await campaignRef.update({
-                        sentCount: admin.firestore.FieldValue.increment(1)
+                    const newSentCount = (campaign.sentCount || 0) + 1;
+                    await db.ref('campaigns/' + campaignId).update({
+                        sentCount: newSentCount
                     });
+                    campaign.sentCount = newSentCount;
 
                     // Update account count
-                    const newCount = (todayCounts.get(account.id) || 0) + 1;
+                    const newCount = currentCount + 1;
                     todayCounts.set(account.id, newCount);
-                    await db.collection('whatsapp_accounts').doc(account.id).update({
+                    await db.ref('whatsapp_accounts/' + account.id).update({
                         todaySent: newCount,
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
-                    // Update user balance (if pricePerMessage set)
+                    // Update user balance
                     if (campaign.pricePerMessage > 0) {
-                        await db.collection('users').doc(userId).update({
-                            balance: admin.firestore.FieldValue.increment(campaign.pricePerMessage),
-                            totalEarned: admin.firestore.FieldValue.increment(campaign.pricePerMessage)
+                        const userSnap = await db.ref('users/' + userId).once('value');
+                        const userData = userSnap.val() || {};
+                        await db.ref('users/' + userId).update({
+                            balance: (userData.balance || 0) + campaign.pricePerMessage,
+                            totalEarned: (userData.totalEarned || 0) + campaign.pricePerMessage,
+                            todayTotalSent: (userData.todayTotalSent || 0) + 1
                         });
                     }
 
-                    console.log(`✅ [${account.id}] Sent to ${target.phone}`);
+                    // Update campaign progress
+                    const progressSnap = await db.ref('campaign_progress/' + userId + '_' + campaignId).once('value');
+                    const progress = progressSnap.val() || {};
+                    await db.ref('campaign_progress/' + userId + '_' + campaignId).set({
+                        userId: userId,
+                        campaignId: campaignId,
+                        campaignName: campaign.name,
+                        accountId: account.id,
+                        pricePerMessage: campaign.pricePerMessage || 0,
+                        sentCount: (progress.sentCount || 0) + 1,
+                        earned: (progress.earned || 0) + (campaign.pricePerMessage || 0),
+                        status: 'active',
+                        updatedAt: admin.database.ServerValue.TIMESTAMP
+                    });
+
+                    console.log(`✅ [${account.id}] Sent to ${target.phone} (${newSentCount}/${campaign.totalTargets})`);
                 } else {
-                    // ⚠️ Message sent but no confirmation
-                    await targetDoc.ref.update({
+                    await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                         status: 'failed',
                         error: 'No message ID returned'
                     });
-                    await campaignRef.update({
-                        failedCount: admin.firestore.FieldValue.increment(1)
+                    
+                    await db.ref('campaigns/' + campaignId).update({
+                        failedCount: (campaign.failedCount || 0) + 1
                     });
-                    logger.warn({ accountId: account.id, phone: target.phone }, 'No confirmation');
                 }
 
             } catch (err) {
-                // ❌ FAILED
-                logger.error({ 
-                    accountId: account.id, 
-                    phone: target.phone,
-                    error: err.message 
-                }, 'Message send failed');
+                logger.error({ accountId: account.id, phone: target.phone, error: err.message }, 'Send failed');
 
-                await targetDoc.ref.update({
+                await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                     status: 'failed',
                     error: err.message
                 });
 
-                await campaignRef.update({
-                    failedCount: admin.firestore.FieldValue.increment(1)
+                await db.ref('campaigns/' + campaignId).update({
+                    failedCount: (campaign.failedCount || 0) + 1
                 });
 
-                // Check if account is banned/logged out
                 if (err.message?.includes('logged out') || err.message?.includes('disconnected')) {
-                    await db.collection('whatsapp_accounts').doc(account.id).update({
+                    await db.ref('whatsapp_accounts/' + account.id).update({
                         status: 'logged_out',
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
                     sessions.delete(account.id);
                     sessionStates.delete(account.id);
+                    
+                    const userId = sessionUserMap.get(account.id);
+                    if (userId) await updateUserDeviceStats(userId);
                 }
             }
 
             accountIndex++;
-
+            
             // Random delay 10-30 seconds
             const randomDelay = Math.floor(Math.random() * 20000) + 10000;
             await delay(randomDelay);
         }
 
-        // Check if campaign completed
-        const pendingSnap = await campaignRef.collection('targets')
-            .where('status', '==', 'pending')
-            .limit(1)
-            .get();
+        // Check if completed
+        const pendingSnap = await db.ref('campaign_targets/' + campaignId)
+            .orderByChild('status')
+            .equalTo('pending')
+            .limitToFirst(1)
+            .once('value');
 
-        if (pendingSnap.empty) {
-            await campaignRef.update({ 
+        if (!pendingSnap.exists()) {
+            await db.ref('campaigns/' + campaignId).update({ 
                 status: 'completed', 
-                completedAt: admin.firestore.FieldValue.serverTimestamp()
+                completedAt: admin.database.ServerValue.TIMESTAMP
             });
-            logger.info({ campaignId }, '✅ Campaign completed!');
+            logger.info({ campaignId }, '🎉 Campaign completed!');
+            
+            // Notify user
+            await db.ref('notifications').push().set({
+                userId: userId,
+                type: 'campaign_completed',
+                title: '🎉 Campaign Completed!',
+                message: `Campaign "${campaign.name}" has been completed. ${campaign.sentCount} messages sent.`,
+                read: false,
+                createdAt: admin.database.ServerValue.TIMESTAMP
+            });
         }
     } catch (err) {
-        logger.error({ campaignId, err }, '❌ Campaign execution error');
+        logger.error({ campaignId, err }, '❌ Campaign error');
         try {
-            await db.collection('campaigns').doc(campaignId).update({
+            await db.ref('campaigns/' + campaignId).update({
                 status: 'error',
                 errorMessage: err.message,
-                errorAt: admin.firestore.FieldValue.serverTimestamp()
+                errorAt: admin.database.ServerValue.TIMESTAMP
             });
-        } catch (e) {
-            logger.error({ campaignId, err: e }, 'Failed to update campaign error state');
-        }
+        } catch (e) {}
+    } finally {
+        activeCampaigns.delete(campaignId);
     }
 }
+
+// ============================================
+// ✅ LISTEN FOR CAMPAIGN CHANGES (REAL-TIME)
+// ============================================
+db.ref('campaigns').on('child_changed', (snapshot) => {
+    const campaign = snapshot.val();
+    const campaignId = snapshot.key;
+    
+    if (campaign.status === 'running' && !activeCampaigns.has(campaignId)) {
+        logger.info({ campaignId }, '▶️ Campaign status changed to running');
+        runCampaign(campaignId);
+    }
+});
+
+db.ref('campaigns').on('child_added', (snapshot) => {
+    const campaign = snapshot.val();
+    const campaignId = snapshot.key;
+    
+    if (campaign.status === 'running' && !activeCampaigns.has(campaignId)) {
+        logger.info({ campaignId }, '🆕 New campaign detected');
+        runCampaign(campaignId);
+    }
+});
 
 // ============================================
 // API ENDPOINTS
@@ -549,14 +649,37 @@ app.post('/api/pair', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Phone number required' });
         }
 
-        // Clean phone - just digits
         phone = phone.replace(/\D/g, '');
         
         if (phone.length < 10) {
             return res.status(400).json({ success: false, error: 'Invalid phone number' });
         }
 
-        const sessionId = uuidv4();
+        // Check if phone already connected to another user
+        const existingSnap = await db.ref('whatsapp_accounts')
+            .orderByChild('phone')
+            .equalTo(phone)
+            .once('value');
+        
+        if (existingSnap.exists()) {
+            let existingUserId = null;
+            existingSnap.forEach((child) => {
+                existingUserId = child.val().userId;
+            });
+            
+            if (existingUserId && existingUserId !== userId) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'This number is already connected to another account!'
+                });
+            }
+        }
+
+        const sessionId = generateId();
+        
+        if (userId) {
+            sessionUserMap.set(sessionId, userId);
+        }
         
         sessionStates.set(sessionId, { 
             status: 'initializing', 
@@ -564,13 +687,10 @@ app.post('/api/pair', async (req, res) => {
             userId: userId || null 
         });
 
-        // Create session
         const sock = await createSession(sessionId, phone);
         
-        // 2 seconds delay for session to initialize
         await delay(2000);
         
-        // Request pairing code
         const code = await sock.requestPairingCode(phone);
         
         if (!code) {
@@ -589,15 +709,14 @@ app.post('/api/pair', async (req, res) => {
             userId: userId || null
         });
 
-        // Save to Firestore
-        await db.collection('whatsapp_accounts').doc(sessionId).set({
+        await db.ref('whatsapp_accounts/' + sessionId).set({
             userId: userId || '',
             phone: phone,
             status: 'pair_ready',
             pairCode: code,
             dailyLimit: 5,
             todaySent: 0,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
+            createdAt: admin.database.ServerValue.TIMESTAMP
         });
 
         res.json({
@@ -617,25 +736,7 @@ app.post('/api/pair', async (req, res) => {
     }
 });
 
-// 2. LIST ACCOUNTS (by userId)
-app.get('/api/accounts', async (req, res) => {
-    try {
-        const { userId } = req.query;
-        let query = db.collection('whatsapp_accounts').orderBy('updatedAt', 'desc');
-        if (userId) {
-            query = query.where('userId', '==', userId);
-        }
-        const snap = await query.get();
-        const accounts = [];
-        snap.forEach(doc => accounts.push({ id: doc.id, ...doc.data() }));
-        res.json(accounts);
-    } catch (err) {
-        logger.error({ err }, 'List accounts error');
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 3. ACCOUNT STATUS
+// 2. ACCOUNT STATUS
 app.get('/api/status/:id', (req, res) => {
     const state = sessionStates.get(req.params.id);
     if (!state) return res.json({ status: 'not_found' });
@@ -647,89 +748,55 @@ app.get('/api/status/:id', (req, res) => {
     });
 });
 
-// 4. SEND SINGLE MESSAGE
-app.post('/api/send', async (req, res) => {
+// 3. DISCONNECT
+app.delete('/api/disconnect/:id', async (req, res) => {
     try {
-        const { accountId, to, text, userId } = req.body;
-        
-        if (!accountId || !to || !text) {
-            return res.status(400).json({
-                success: false,
-                error: 'Missing required fields: accountId, to, text'
-            });
+        const sock = sessions.get(req.params.id);
+        if (sock) {
+            await sock.logout();
+            await sock.end();
         }
+        sessions.delete(req.params.id);
+        sessionStates.delete(req.params.id);
+        const userId = sessionUserMap.get(req.params.id);
+        sessionUserMap.delete(req.params.id);
 
-        const sock = sessions.get(accountId);
-
-        if (!sock || sessionStates.get(accountId)?.status !== 'connected') {
-            return res.status(400).json({
-                success: false,
-                error: 'Account not connected',
-                status: sessionStates.get(accountId)?.status || 'unknown'
-            });
-        }
-
-        // Validate recipient phone
-        let cleanTo = String(to).replace(/\D/g, '');
-        if (cleanTo.startsWith('0')) cleanTo = cleanTo.slice(1);
-        if (!cleanTo.startsWith('880')) cleanTo = '880' + cleanTo;
-        
-        const jidTo = `${cleanTo}@s.whatsapp.net`;
-        const result = await sock.sendMessage(jidTo, { text });
-
-        if (!result?.key?.id) {
-            return res.status(400).json({
-                success: false,
-                error: 'Message not confirmed - may not have been delivered'
-            });
-        }
-
-        // Increment count
-        const newCount = (todayCounts.get(accountId) || 0) + 1;
-        todayCounts.set(accountId, newCount);
-        await db.collection('whatsapp_accounts').doc(accountId).update({
-            todaySent: newCount,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        await db.ref('whatsapp_accounts/' + req.params.id).update({
+            status: 'disconnected',
+            updatedAt: admin.database.ServerValue.TIMESTAMP
         });
 
-        // Save message log
-        await db.collection('message_logs').add({
-            accountId,
-            userId: userId || '',
-            to: jidTo,
-            text,
-            status: 'sent',
-            messageId: result.key.id,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+        if (userId) await updateUserDeviceStats(userId);
 
-        res.json({
-            success: true,
-            messageId: result.key.id,
-            todaySent: newCount
-        });
-    } catch (err) {
-        // Save failed log
         try {
-            await db.collection('message_logs').add({
-                accountId: req.body.accountId,
-                userId: req.body.userId || '',
-                to: req.body.to,
-                text: req.body.text,
-                status: 'failed',
-                error: err.message,
-                createdAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-        } catch (e) {
-            logger.error({ err: e }, 'Failed to log message error');
+            await db.ref('session_data/' + req.params.id).remove();
+        } catch (e) {}
+
+        res.json({ success: true });
+    } catch (err) {
+        logger.error({ sessionId: req.params.id, err }, 'Disconnect error');
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// 4. SET DAILY LIMIT
+app.post('/api/limit/:id', async (req, res) => {
+    try {
+        const { limit } = req.body;
+        const parsedLimit = parseInt(limit);
+        
+        if (!limit || parsedLimit < 0) {
+            return res.status(400).json({ success: false, error: 'Invalid limit' });
         }
 
-        logger.error({ accountId: req.body.accountId, err }, 'Send message error');
-        res.status(400).json({
-            success: false,
-            error: err.message,
-            isLoggedOut: err.message?.includes('logged out') || false
+        dailyLimits.set(req.params.id, parsedLimit);
+        await db.ref('whatsapp_accounts/' + req.params.id).update({ 
+            dailyLimit: parsedLimit,
+            updatedAt: admin.database.ServerValue.TIMESTAMP
         });
+        res.json({ success: true, dailyLimit: parsedLimit });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
@@ -741,23 +808,10 @@ app.post('/api/campaign/start', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Missing fields' });
         }
 
-        // Check if user has connected accounts
-        const accSnap = await db.collection('whatsapp_accounts')
-            .where('userId', '==', userId)
-            .where('status', '==', 'connected')
-            .get();
+        const campaignId = generateId();
+        const now = new Date().toISOString();
 
-        if (accSnap.empty) {
-            return res.status(400).json({
-                success: false,
-                error: 'No connected WhatsApp accounts. Please connect an account first.'
-            });
-        }
-
-        const campaignRef = db.collection('campaigns').doc();
-        const campaignId = campaignRef.id;
-
-        const campaignData = {
+        await db.ref('campaigns/' + campaignId).set({
             userId,
             name,
             message,
@@ -766,59 +820,30 @@ app.post('/api/campaign/start', async (req, res) => {
             failedCount: 0,
             status: 'running',
             pricePerMessage: pricePerMessage || 0,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        };
+            createdAt: now
+        });
 
-        await campaignRef.set(campaignData);
-
-        // Store targets in subcollection with validated phone numbers
-        const BATCH_SIZE = 400;
-        for (let i = 0; i < targets.length; i += BATCH_SIZE) {
-            const batch = db.batch();
-            const chunk = targets.slice(i, i + BATCH_SIZE);
-            chunk.forEach((t, idx) => {
-                // Validate and clean each target phone
-                let cleanPhone = String(t.phone).replace(/\D/g, '');
-                if (cleanPhone.startsWith('0')) cleanPhone = cleanPhone.slice(1);
-                if (!cleanPhone.startsWith('880')) cleanPhone = '880' + cleanPhone;
-                
-                const targetRef = campaignRef.collection('targets').doc(String(i + idx));
-                batch.set(targetRef, {
-                    phone: cleanPhone,
-                    name: t.name || '',
-                    status: 'pending'
-                });
-            });
-            await batch.commit();
-        }
+        // Save targets
+        const targetUpdates = {};
+        targets.forEach((t, idx) => {
+            let cleanPhone = String(t.phone).replace(/\D/g, '');
+            if (cleanPhone.startsWith('0')) cleanPhone = cleanPhone.slice(1);
+            if (!cleanPhone.startsWith('880')) cleanPhone = '880' + cleanPhone;
+            
+            targetUpdates['campaign_targets/' + campaignId + '/' + idx] = {
+                phone: cleanPhone,
+                name: t.name || '',
+                status: 'pending',
+                createdAt: now
+            };
+        });
+        
+        await db.ref().update(targetUpdates);
 
         logger.info({ campaignId, userId, targetCount: targets.length }, 'Campaign created');
 
-        // Start campaign loop
+        // Start campaign
         runCampaign(campaignId);
-
-        // Firestore listener for pause/resume with automatic cleanup
-        if (campaignListeners.has(campaignId)) {
-            campaignListeners.get(campaignId)(); // Cleanup old listener
-        }
-
-        const unsubscribe = campaignRef.onSnapshot(snapshot => {
-            const data = snapshot.data();
-            if (!data) return;
-            
-            if (data.status === 'running') {
-                logger.info({ campaignId }, '▶️ Campaign resumed');
-                runCampaign(campaignId);
-            }
-            
-            if (data.status === 'completed' || data.status === 'paused' || data.status === 'error') {
-                logger.info({ campaignId, status: data.status }, 'Cleaning up campaign listener');
-                unsubscribe(); // Cleanup listener
-                campaignListeners.delete(campaignId);
-            }
-        });
-        
-        campaignListeners.set(campaignId, unsubscribe);
 
         res.json({ success: true, campaignId, totalTargets: targets.length });
     } catch (err) {
@@ -827,173 +852,47 @@ app.post('/api/campaign/start', async (req, res) => {
     }
 });
 
-// 6. PAUSE CAMPAIGN
-app.post('/api/campaign/pause', async (req, res) => {
+// 6. SEND SINGLE MESSAGE
+app.post('/api/send', async (req, res) => {
     try {
-        const { campaignId } = req.body;
+        const { accountId, to, text, userId } = req.body;
         
-        if (!campaignId) {
-            return res.status(400).json({ success: false, error: 'campaignId required' });
+        if (!accountId || !to || !text) {
+            return res.status(400).json({ success: false, error: 'Missing fields' });
         }
 
-        await db.collection('campaigns').doc(campaignId).update({ 
-            status: 'paused',
-            pausedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        res.json({ success: true });
-    } catch (err) {
-        logger.error({ campaignId: req.body.campaignId, err }, 'Pause campaign error');
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+        const sock = sessions.get(accountId);
+        if (!sock || sessionStates.get(accountId)?.status !== 'connected') {
+            return res.status(400).json({ success: false, error: 'Account not connected' });
+        }
 
-// 7. RESUME CAMPAIGN
-app.post('/api/campaign/resume', async (req, res) => {
-    try {
-        const { campaignId } = req.body;
+        let cleanTo = String(to).replace(/\D/g, '');
+        if (cleanTo.startsWith('0')) cleanTo = cleanTo.slice(1);
+        if (!cleanTo.startsWith('880')) cleanTo = '880' + cleanTo;
         
-        if (!campaignId) {
-            return res.status(400).json({ success: false, error: 'campaignId required' });
+        const jidTo = `${cleanTo}@s.whatsapp.net`;
+        const result = await sock.sendMessage(jidTo, { text });
+
+        if (!result?.key?.id) {
+            return res.status(400).json({ success: false, error: 'Message not confirmed' });
         }
 
-        await db.collection('campaigns').doc(campaignId).update({ 
-            status: 'running',
-            resumedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        res.json({ success: true });
-    } catch (err) {
-        logger.error({ campaignId: req.body.campaignId, err }, 'Resume campaign error');
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 8. DISCONNECT ACCOUNT
-app.delete('/api/disconnect/:id', async (req, res) => {
-    try {
-        const sock = sessions.get(req.params.id);
-        if (sock) {
-            await sock.logout();
-            await sock.end();
-        }
-        sessions.delete(req.params.id);
-        sessionStates.delete(req.params.id);
-        sessionUserMap.delete(req.params.id);
-
-        await db.collection('whatsapp_accounts').doc(req.params.id).update({
-            status: 'disconnected',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        const newCount = (todayCounts.get(accountId) || 0) + 1;
+        todayCounts.set(accountId, newCount);
+        await db.ref('whatsapp_accounts/' + accountId).update({
+            todaySent: newCount,
+            updatedAt: admin.database.ServerValue.TIMESTAMP
         });
 
-        // Delete Firestore session
-        try {
-            await db.collection('session_data').doc(req.params.id).delete();
-            logger.info({ sessionId: req.params.id }, '🗑️ Session data deleted from Firestore');
-        } catch (e) {
-            logger.warn({ sessionId: req.params.id }, 'Session cleanup failed');
-        }
-
-        res.json({ success: true });
-    } catch (err) {
-        logger.error({ sessionId: req.params.id, err }, 'Disconnect error');
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 8b. Additional disconnect endpoint for frontend compatibility
-app.delete('/api/accounts/:id', async (req, res) => {
-    try {
-        const sock = sessions.get(req.params.id);
-        if (sock) {
-            await sock.logout();
-            await sock.end();
-        }
-        sessions.delete(req.params.id);
-        sessionStates.delete(req.params.id);
-        sessionUserMap.delete(req.params.id);
-
-        await db.collection('whatsapp_accounts').doc(req.params.id).update({
-            status: 'disconnected',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        await db.ref('message_logs').push().set({
+            accountId, userId: userId || '', to: jidTo, text,
+            status: 'sent', messageId: result.key.id,
+            createdAt: admin.database.ServerValue.TIMESTAMP
         });
 
-        // Delete Firestore session
-        try {
-            await db.collection('session_data').doc(req.params.id).delete();
-            logger.info({ sessionId: req.params.id }, '🗑️ Session data deleted from Firestore');
-        } catch (e) {
-            logger.warn({ sessionId: req.params.id }, 'Session cleanup failed');
-        }
-
-        res.json({ success: true, message: 'Device disconnected' });
+        res.json({ success: true, messageId: result.key.id, todaySent: newCount });
     } catch (err) {
-        logger.error({ sessionId: req.params.id, err }, 'Disconnect error');
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 9. SET DAILY LIMIT
-app.post('/api/limit/:id', async (req, res) => {
-    try {
-        const { limit } = req.body;
-        
-        if (!limit || isNaN(parseInt(limit)) || parseInt(limit) < 0) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Invalid limit: must be a positive number' 
-            });
-        }
-
-        const parsedLimit = parseInt(limit);
-        dailyLimits.set(req.params.id, parsedLimit);
-        await db.collection('whatsapp_accounts').doc(req.params.id).update({ 
-            dailyLimit: parsedLimit,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        res.json({ success: true, dailyLimit: parsedLimit });
-    } catch (err) {
-        logger.error({ sessionId: req.params.id, err }, 'Set limit error');
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 10. GET NOTIFICATIONS
-app.get('/api/notifications/:userId', async (req, res) => {
-    try {
-        const snap = await db.collection('notifications')
-            .where('userId', '==', req.params.userId)
-            .orderBy('createdAt', 'desc')
-            .limit(50)
-            .get();
-
-        const notifications = [];
-        snap.forEach(doc => notifications.push({ id: doc.id, ...doc.data() }));
-        res.json(notifications);
-    } catch (err) {
-        logger.error({ userId: req.params.userId, err }, 'Get notifications error');
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 11. MARK NOTIFICATION READ
-app.post('/api/notifications/read', async (req, res) => {
-    try {
-        const { notificationId } = req.body;
-        
-        if (!notificationId) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'notificationId required' 
-            });
-        }
-
-        await db.collection('notifications').doc(notificationId).update({ 
-            read: true,
-            readAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        res.json({ success: true });
-    } catch (err) {
-        logger.error({ notificationId: req.body.notificationId, err }, 'Mark read error');
-        res.status(500).json({ success: false, error: err.message });
+        res.status(400).json({ success: false, error: err.message });
     }
 });
 
@@ -1004,10 +903,14 @@ cron.schedule('0 0 * * *', async () => {
     try {
         console.log('🕛 Midnight reset');
         todayCounts.clear();
-        const batch = db.batch();
-        const snap = await db.collection('whatsapp_accounts').get();
-        snap.forEach(doc => batch.update(doc.ref, { todaySent: 0 }));
-        await batch.commit();
+        
+        const snap = await db.ref('whatsapp_accounts').once('value');
+        const updates = {};
+        snap.forEach((child) => {
+            updates['whatsapp_accounts/' + child.key + '/todaySent'] = 0;
+        });
+        await db.ref().update(updates);
+        
         logger.info('✅ Daily counts reset');
     } catch (err) {
         logger.error({ err }, 'Midnight reset error');
@@ -1018,34 +921,39 @@ cron.schedule('0 0 * * *', async () => {
 });
 
 // ============================================
-// AUTO-SAVE SESSIONS EVERY 5 MINUTES
+// AUTO-SAVE SESSIONS
 // ============================================
 setInterval(async () => {
     try {
         for (const sessionId of sessions.keys()) {
             if (sessionStates.get(sessionId)?.status === 'connected') {
-                await saveSessionToFirestore(sessionId);
+                await saveSessionToDB(sessionId);
             }
         }
-        console.log('💾 Sessions auto-saved to Firestore');
+        console.log('💾 Sessions auto-saved');
     } catch (err) {
-        logger.error({ err }, 'Auto-save sessions error');
+        logger.error({ err }, 'Auto-save error');
     }
-}, 300000); // 5 minutes
+}, 300000);
 
 // ============================================
 // LOAD SESSIONS ON STARTUP
 // ============================================
 async function loadAllSessions() {
     try {
-        const snap = await db.collection('whatsapp_accounts')
-            .where('status', '==', 'connected')
-            .get();
+        const snap = await db.ref('whatsapp_accounts')
+            .orderByChild('status')
+            .equalTo('connected')
+            .once('value');
 
-        for (const doc of snap.docs) {
-            const data = doc.data();
-            const sessionId = doc.id;
-            const loaded = await loadSessionFromFirestore(sessionId);
+        const sessions = [];
+        snap.forEach((child) => {
+            sessions.push({ id: child.key, ...child.val() });
+        });
+
+        for (const data of sessions) {
+            const sessionId = data.id;
+            const loaded = await loadSessionFromDB(sessionId);
 
             if (loaded) {
                 console.log(`📂 Restoring session: ${data.phone}`);
@@ -1053,10 +961,22 @@ async function loadAllSessions() {
                     sessionUserMap.set(sessionId, data.userId);
                 }
                 await createSession(sessionId, data.phone);
-                await delay(2000);
+                await delay(3000);
             }
         }
-        logger.info('✅ All sessions loaded');
+        logger.info(`✅ ${sessions.length} sessions loaded`);
+        
+        // Check for running campaigns
+        const campaignsSnap = await db.ref('campaigns')
+            .orderByChild('status')
+            .equalTo('running')
+            .once('value');
+        
+        campaignsSnap.forEach((child) => {
+            logger.info({ campaignId: child.key }, '▶️ Resuming campaign');
+            runCampaign(child.key);
+        });
+        
     } catch (err) {
         logger.error({ err }, 'Session load error');
     }
@@ -1070,21 +990,10 @@ app.get('*', (req, res) => {
 });
 
 // ============================================
-// ERROR HANDLER MIDDLEWARE
-// ============================================
-app.use((err, req, res, next) => {
-    logger.error({ err, path: req.path, method: req.method }, 'Unhandled error');
-    res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-    });
-});
-
-// ============================================
 // START SERVER
 // ============================================
 app.listen(PORT, async () => {
-    console.log(`🚀 WS-Income Engine v2.2 on port ${PORT}`);
-    console.log(`📡 Firebase Firestore Sessions | Anti-Duplicate | Error Resilient`);
+    console.log(`🚀 WS-Income Engine v3.0 on port ${PORT}`);
+    console.log(`📡 Firebase Realtime Database | Real-time Campaign Engine`);
     await loadAllSessions();
 });
