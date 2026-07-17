@@ -449,15 +449,11 @@ async function runCampaign(campaignId) {
         }
 
         if (joinedAccounts.length === 0) {
-            logger.info({ campaignId }, '⏸️ No joined accounts available, pausing');
-            await db.ref('campaigns/' + campaignId).update({ 
-                status: 'paused',
-                pausedReason: 'No joined accounts'
-            });
+            logger.info({ campaignId }, '⏸️ No joined accounts available, waiting...');
+    // ✅ শুধু return, paused সেট করবে না!
             activeCampaigns.delete(campaignId);
             return;
         }
-
         // Get full account details for joined accounts
         const availableAccounts = [];
         for (const acc of joinedAccounts) {
@@ -656,9 +652,15 @@ db.ref('campaigns').on('child_changed', (snapshot) => {
     const campaign = snapshot.val();
     const campaignId = snapshot.key;
     
+    // ✅ Only run if status changed TO running (not already running)
     if (campaign.status === 'running' && !activeCampaigns.has(campaignId)) {
         logger.info({ campaignId }, '▶️ Campaign status changed to running');
         runCampaign(campaignId);
+    }
+    
+    // ✅ If paused/completed/error - just log, don't re-run
+    if (campaign.status === 'paused' || campaign.status === 'completed' || campaign.status === 'error') {
+        logger.info({ campaignId, status: campaign.status }, 'ℹ️ Campaign status updated');
     }
 });
 
