@@ -428,10 +428,8 @@ async function runCampaign(campaignId) {
         }
 
         // ✅ JOIN CHECK: শুধু Join করা users-দের account নাও
-        const progressSnap = await db.ref('campaign_progress')
-            .orderByChild('campaignId')
-            .equalTo(campaignId)
-            .once('value');
+        // ✅ JOIN CHECK: campaign_progress/{campaignId} থেকে নাও
+        const progressSnap = await db.ref('campaign_progress/' + campaignId).once('value');
 
         const joinedAccounts = [];
         if (progressSnap.exists()) {
