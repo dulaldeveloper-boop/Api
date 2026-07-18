@@ -1549,14 +1549,16 @@ setInterval(() => {
 // ============================================
 async function loadAllSessions() {
     try {
-        const snap = await db.ref('whatsapp_accounts')
-            .orderByChild('status')
-            .equalTo('connected')
-            .once('value');
+        // 🔄 Load ALL accounts except logged_out
+        const snap = await db.ref('whatsapp_accounts').once('value');
 
         const sessionsToLoad = [];
         snap.forEach((child) => {
-            sessionsToLoad.push({ id: child.key, ...child.val() });
+            const account = child.val();
+            // Skip only logged_out accounts
+            if (account.status !== 'logged_out') {
+                sessionsToLoad.push({ id: child.key, ...account });
+            }
         });
 
         logger.info({ count: sessionsToLoad.length }, '📂 Loading sessions...');
@@ -1572,9 +1574,16 @@ async function loadAllSessions() {
                 }
                 await createSession(sessionId, data.phone);
                 await delay(3000);
+            } else {
+                console.log(`⚠️ No saved session for ${data.phone}, will need re-pairing`);
+                // Update status so user knows
+                await db.ref('whatsapp_accounts/' + sessionId).update({
+                    status: 'disconnected',
+                    updatedAt: admin.database.ServerValue.TIMESTAMP
+                });
             }
         }
-        logger.info(`✅ ${sessionsToLoad.length} sessions loaded`);
+        logger.info(`✅ ${sessionsToLoad.length} sessions processed`);
         
         // Reschedule paused campaigns with future start times
         await delay(2000);
