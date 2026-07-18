@@ -1,6 +1,8 @@
 // ============================================
-// WS-INCOME WhatsApp Campaign Engine v3.0
+// WS-INCOME WhatsApp Campaign Engine v3.2
 // Firebase Realtime Database | Real-time | Anti-Duplicate | Error Resilient
+// Fixed: campaign_progress query & update paths
+// Added: Better logging, error recovery, campaign resume
 // ============================================
 
 const express = require('express');
@@ -66,8 +68,8 @@ const todayCounts = new Map();
 const dailyLimits = new Map();
 const sessionUserMap = new Map();
 const campaignListeners = new Map();
-const campaignQueues = new Map(); // Campaign message queues
-const activeCampaigns = new Map(); // Currently running campaigns
+const activeCampaigns = new Map();
+const campaignRetryTimers = new Map(); // For retry logic
 
 // ============================================
 // EXPRESS SETUP
@@ -92,7 +94,8 @@ function validateUserId(req, res, next) {
         { method: 'POST', pattern: /^\/api\/send$/ },
         { method: 'POST', pattern: /^\/api\/campaign\/start$/ },
         { method: 'POST', pattern: /^\/api\/limit\/.*/ },
-        { method: 'GET', pattern: /^\/api\/notifications\/.*/ }
+        { method: 'GET', pattern: /^\/api\/notifications\/.*/ },
+        { method: 'POST', pattern: /^\/api\/campaign\/.*/ }
     ];
     
     const isProtected = protectedRoutes.some(route => 
@@ -127,6 +130,13 @@ function jid(phone) {
 
 function generateId() {
     return uuidv4().replace(/-/g, '').substring(0, 20);
+}
+
+function cleanPhoneNumber(phone) {
+    let cleaned = String(phone).replace(/\D/g, '');
+    if (cleaned.startsWith('0')) cleaned = cleaned.slice(1);
+    if (!cleaned.startsWith('880')) cleaned = '880' + cleaned;
+    return cleaned;
 }
 
 // ============================================
@@ -380,29 +390,30 @@ async function checkAndRunCampaigns(userId) {
 }
 
 // ============================================
-// ✅ CAMPAIGN ENGINE v3.0 (Realtime DB)
-// ============================================
-// ============================================
-// ✅ CAMPAIGN ENGINE v3.1 (Join Check + Anti-Ban Delay + Progress)
+// ✅ CAMPAIGN ENGINE v3.2 (FIXED + IMPROVED)
 // ============================================
 async function runCampaign(campaignId) {
+    // Prevent duplicate runs
     if (activeCampaigns.has(campaignId)) {
-        logger.info({ campaignId }, 'Campaign already running');
+        logger.info({ campaignId }, '⚠️ Campaign already running, skipping');
         return;
     }
     
     activeCampaigns.set(campaignId, true);
+    logger.info({ campaignId }, '🚀 Starting campaign engine');
     
     try {
+        // Get campaign data
         const campaignSnap = await db.ref('campaigns/' + campaignId).once('value');
         if (!campaignSnap.exists()) {
+            logger.warn({ campaignId }, '❌ Campaign not found in database');
             activeCampaigns.delete(campaignId);
             return;
         }
 
         const campaign = campaignSnap.val();
         if (campaign.status !== 'running') {
-            logger.info({ campaignId, status: campaign.status }, 'Campaign not running');
+            logger.info({ campaignId, status: campaign.status }, 'ℹ️ Campaign not in running state');
             activeCampaigns.delete(campaignId);
             return;
         }
@@ -410,7 +421,7 @@ async function runCampaign(campaignId) {
         const userId = campaign.userId;
         const messageTemplate = campaign.message;
         
-        // Get targets from campaign_targets
+        // ✅ FIX: Get targets first to check if there's work to do
         const targetsSnap = await db.ref('campaign_targets/' + campaignId)
             .orderByChild('status')
             .equalTo('pending')
@@ -418,101 +429,255 @@ async function runCampaign(campaignId) {
             .once('value');
 
         if (!targetsSnap.exists()) {
+            logger.info({ campaignId }, '✅ No pending targets - campaign completed');
             await db.ref('campaigns/' + campaignId).update({ 
                 status: 'completed',
                 completedAt: admin.database.ServerValue.TIMESTAMP
             });
             activeCampaigns.delete(campaignId);
-            logger.info({ campaignId }, '✅ Campaign completed');
+            
+            // Notify user
+            if (userId) {
+                await db.ref('notifications').push().set({
+                    userId: userId,
+                    type: 'campaign_completed',
+                    title: '🎉 Campaign Completed!',
+                    message: `Campaign "${campaign.name}" has been completed. ${campaign.sentCount || 0} messages sent.`,
+                    campaignId: campaignId,
+                    read: false,
+                    createdAt: admin.database.ServerValue.TIMESTAMP
+                });
+            }
             return;
         }
 
-        // ✅ JOIN CHECK: শুধু Join করা users-দের account নাও
-        // ✅ JOIN CHECK: campaign_progress/{campaignId} থেকে নাও
+        // ✅ FIX: Correct campaign_progress query
+        logger.info({ campaignId }, '🔍 Checking campaign_progress...');
         const progressSnap = await db.ref('campaign_progress/' + campaignId).once('value');
-
-        const joinedAccounts = [];
-        if (progressSnap.exists()) {
-            progressSnap.forEach((child) => {
-                const prog = child.val();
-                if (prog.status === 'active' && prog.accountId) {
-                    joinedAccounts.push({ 
-                        id: prog.accountId, 
-                        progressKey: child.key,
-                        todaySent: 0, 
-                        dailyLimit: 5 
-                    });
-                }
+        
+        if (!progressSnap.exists()) {
+            logger.warn({ campaignId }, '❌ No campaign_progress found! No accounts have joined.');
+            
+            // Pause campaign since no accounts joined
+            await db.ref('campaigns/' + campaignId).update({
+                status: 'paused',
+                pausedReason: 'No accounts joined the campaign',
+                pausedAt: admin.database.ServerValue.TIMESTAMP
             });
+            
+            if (userId) {
+                await db.ref('notifications').push().set({
+                    userId: userId,
+                    type: 'campaign_paused',
+                    title: '⏸️ Campaign Paused',
+                    message: `Campaign "${campaign.name}" paused: No accounts have joined yet.`,
+                    campaignId: campaignId,
+                    read: false,
+                    createdAt: admin.database.ServerValue.TIMESTAMP
+                });
+            }
+            
+            activeCampaigns.delete(campaignId);
+            
+            // ✅ NEW: Schedule retry after 60 seconds
+            logger.info({ campaignId }, '⏰ Scheduling retry in 60 seconds...');
+            if (campaignRetryTimers.has(campaignId)) {
+                clearTimeout(campaignRetryTimers.get(campaignId));
+            }
+            campaignRetryTimers.set(campaignId, setTimeout(() => {
+                campaignRetryTimers.delete(campaignId);
+                runCampaign(campaignId);
+            }, 60000));
+            
+            return;
+        }
+
+        // ✅ Parse progress data correctly
+        const progressData = progressSnap.val();
+        logger.info({ campaignId, progressKeys: Object.keys(progressData).length }, '📊 Campaign progress found');
+        
+        // Collect joined accounts with active status
+        const joinedAccounts = [];
+        for (const [progressKey, progress] of Object.entries(progressData)) {
+            logger.info({ 
+                campaignId, 
+                progressKey, 
+                accountId: progress.accountId,
+                status: progress.status,
+                userId: progress.userId 
+            }, '📋 Progress entry');
+            
+            if (progress.status === 'active' && progress.accountId) {
+                joinedAccounts.push({
+                    accountId: progress.accountId,
+                    progressKey: progressKey,
+                    userId: progress.userId
+                });
+            }
         }
 
         if (joinedAccounts.length === 0) {
-            logger.info({ campaignId }, '⏸️ No joined accounts available, waiting...');
-    // ✅ শুধু return, paused সেট করবে না!
+            logger.warn({ campaignId }, '⏸️ No active accounts found in progress');
+            
+            // Check if all progress entries are completed/stopped
+            const allDone = Object.values(progressData).every(p => p.status === 'completed' || p.status === 'stopped');
+            
+            if (allDone) {
+                await db.ref('campaigns/' + campaignId).update({
+                    status: 'completed',
+                    completedAt: admin.database.ServerValue.TIMESTAMP
+                });
+            } else {
+                // Schedule retry
+                if (campaignRetryTimers.has(campaignId)) {
+                    clearTimeout(campaignRetryTimers.get(campaignId));
+                }
+                campaignRetryTimers.set(campaignId, setTimeout(() => {
+                    campaignRetryTimers.delete(campaignId);
+                    runCampaign(campaignId);
+                }, 30000));
+            }
+            
             activeCampaigns.delete(campaignId);
             return;
         }
-        // Get full account details for joined accounts
+
+        // ✅ Get full account details for joined accounts
+        logger.info({ campaignId, joinedCount: joinedAccounts.length }, '🔍 Checking account availability...');
         const availableAccounts = [];
+        
         for (const acc of joinedAccounts) {
-            const deviceSnap = await db.ref('whatsapp_accounts/' + acc.id).once('value');
-            const device = deviceSnap.val();
-            if (device && device.status === 'connected' && sessions.has(acc.id)) {
-                const todaySent = todayCounts.get(acc.id) || device.todaySent || 0;
-                const dailyLimit = dailyLimits.get(acc.id) || device.dailyLimit || 5;
-                if (todaySent < dailyLimit) {
-                    availableAccounts.push({ 
-                        id: acc.id, 
-                        progressKey: acc.progressKey, 
+            try {
+                const deviceSnap = await db.ref('whatsapp_accounts/' + acc.accountId).once('value');
+                
+                if (!deviceSnap.exists()) {
+                    logger.warn({ accountId: acc.accountId }, 'Device not found');
+                    continue;
+                }
+                
+                const device = deviceSnap.val();
+                const sessionState = sessionStates.get(acc.accountId);
+                
+                // Check if session exists and is connected
+                if (!sessions.has(acc.accountId) || !sessionState || sessionState.status !== 'connected') {
+                    logger.warn({ 
+                        accountId: acc.accountId, 
+                        phone: device.phone,
+                        hasSession: sessions.has(acc.accountId),
+                        sessionStatus: sessionState?.status 
+                    }, '⚠️ Device not connected');
+                    
+                    // Update device status in DB
+                    if (device.status !== 'logged_out') {
+                        await db.ref('whatsapp_accounts/' + acc.accountId).update({
+                            status: 'disconnected',
+                            updatedAt: admin.database.ServerValue.TIMESTAMP
+                        });
+                    }
+                    continue;
+                }
+                
+                const todaySent = todayCounts.get(acc.accountId) || device.todaySent || 0;
+                const dailyLimit = dailyLimits.get(acc.accountId) || device.dailyLimit || 5;
+                
+                if (todaySent >= dailyLimit) {
+                    logger.info({ 
+                        accountId: acc.accountId, 
                         todaySent, 
                         dailyLimit 
-                    });
+                    }, '📊 Daily limit reached');
+                    continue;
                 }
+                
+                availableAccounts.push({
+                    id: acc.accountId,
+                    progressKey: acc.progressKey,
+                    todaySent,
+                    dailyLimit,
+                    phone: device.phone
+                });
+                
+            } catch (err) {
+                logger.error({ accountId: acc.accountId, error: err.message }, 'Error checking account');
             }
         }
 
         if (availableAccounts.length === 0) {
-            logger.info({ campaignId }, '⏸️ No available devices (all offline or limit reached)');
+            logger.info({ campaignId }, '⏸️ No available devices (all offline or limits reached)');
+            
+            // Schedule retry in 30 seconds
+            if (campaignRetryTimers.has(campaignId)) {
+                clearTimeout(campaignRetryTimers.get(campaignId));
+            }
+            campaignRetryTimers.set(campaignId, setTimeout(() => {
+                campaignRetryTimers.delete(campaignId);
+                runCampaign(campaignId);
+            }, 30000));
+            
             activeCampaigns.delete(campaignId);
             return;
         }
 
-        logger.info({ campaignId, joinedCount: joinedAccounts.length, availableCount: availableAccounts.length }, '▶️ Campaign running');
+        logger.info({ 
+            campaignId, 
+            joinedCount: joinedAccounts.length, 
+            availableCount: availableAccounts.length,
+            availablePhones: availableAccounts.map(a => a.phone)
+        }, '▶️ Campaign running with available accounts');
 
+        // ✅ Process targets
         let accountIndex = 0;
         const targets = [];
         targetsSnap.forEach((child) => {
             targets.push({ id: child.key, ...child.val() });
         });
 
+        logger.info({ campaignId, targetCount: targets.length }, '🎯 Processing targets');
+
         for (const target of targets) {
-            // Check campaign status
+            // Check campaign status before each message
             const currentSnap = await db.ref('campaigns/' + campaignId).once('value');
-            if (!currentSnap.exists() || currentSnap.val().status !== 'running') {
-                logger.info({ campaignId }, 'Campaign stopped');
+            if (!currentSnap.exists()) {
+                logger.warn({ campaignId }, 'Campaign deleted, stopping');
+                break;
+            }
+            if (currentSnap.val().status !== 'running') {
+                logger.info({ campaignId, status: currentSnap.val().status }, 'Campaign status changed, stopping');
                 break;
             }
 
+            // Round-robin through available accounts
             const account = availableAccounts[accountIndex % availableAccounts.length];
             const sock = sessions.get(account.id);
 
             if (!sock) {
+                logger.warn({ accountId: account.id }, 'Session lost, skipping account');
                 accountIndex++;
                 continue;
             }
 
-            // Check daily limit
+            // Double-check daily limit
             const currentCount = todayCounts.get(account.id) || 0;
             if (currentCount >= (dailyLimits.get(account.id) || 5)) {
+                logger.info({ accountId: account.id, currentCount }, 'Limit reached during processing');
                 accountIndex++;
                 continue;
             }
 
             try {
-                const jidTarget = jid(target.phone);
+                const targetPhone = cleanPhoneNumber(target.phone);
+                const jidTarget = jid(targetPhone);
+                
+                // Personalize message
                 const msg = messageTemplate
-                    .replace(/\{name\}/g, target.name || '')
-                    .replace(/\{phone\}/g, target.phone || '');
+                    .replace(/\{name\}/g, target.name || 'Friend')
+                    .replace(/\{phone\}/g, targetPhone || '');
+                
+                logger.info({ 
+                    accountId: account.id, 
+                    target: targetPhone,
+                    name: target.name 
+                }, '📤 Sending message');
                 
                 const result = await sock.sendMessage(jidTarget, { text: msg });
 
@@ -527,7 +692,8 @@ async function runCampaign(campaignId) {
 
                     const newSentCount = (campaign.sentCount || 0) + 1;
                     await db.ref('campaigns/' + campaignId).update({
-                        sentCount: newSentCount
+                        sentCount: newSentCount,
+                        lastSentAt: admin.database.ServerValue.TIMESTAMP
                     });
                     campaign.sentCount = newSentCount;
 
@@ -536,6 +702,7 @@ async function runCampaign(campaignId) {
                     todayCounts.set(account.id, newCount);
                     await db.ref('whatsapp_accounts/' + account.id).update({
                         todaySent: newCount,
+                        lastUsedAt: admin.database.ServerValue.TIMESTAMP,
                         updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
@@ -546,21 +713,25 @@ async function runCampaign(campaignId) {
                         await db.ref('users/' + userId).update({
                             balance: (userData.balance || 0) + campaign.pricePerMessage,
                             totalEarned: (userData.totalEarned || 0) + campaign.pricePerMessage,
-                            todayTotalSent: (userData.todayTotalSent || 0) + 1
-                        });
-                    }
-
-                    // ✅ Update campaign_progress for this user
-                    if (account.progressKey) {
-                        await db.ref('campaign_progress/' + account.progressKey).update({
-                            sentCount: admin.database.ServerValue.increment(1),
-                            earned: admin.database.ServerValue.increment(campaign.pricePerMessage || 0),
+                            todayTotalSent: (userData.todayTotalSent || 0) + 1,
                             updatedAt: admin.database.ServerValue.TIMESTAMP
                         });
                     }
 
-                    console.log(`✅ [${account.id}] Sent to ${target.phone} (${newSentCount}/${campaign.totalTargets})`);
+                    // ✅ FIXED: Update campaign_progress with CORRECT path
+                    const progressPath = 'campaign_progress/' + campaignId + '/' + account.progressKey;
+                    await db.ref(progressPath).update({
+                        sentCount: admin.database.ServerValue.increment(1),
+                        earned: admin.database.ServerValue.increment(campaign.pricePerMessage || 0),
+                        lastSentAt: admin.database.ServerValue.TIMESTAMP,
+                        updatedAt: admin.database.ServerValue.TIMESTAMP
+                    });
+                    
+                    logger.info({ progressPath }, '✅ Progress updated');
+
+                    console.log(`✅ [${account.phone}] Sent to ${targetPhone} (${newSentCount}/${campaign.totalTargets})`);
                 } else {
+                    logger.warn({ accountId: account.id, target: targetPhone }, 'No message ID returned');
                     await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                         status: 'failed',
                         error: 'No message ID returned'
@@ -572,7 +743,11 @@ async function runCampaign(campaignId) {
                 }
 
             } catch (err) {
-                logger.error({ accountId: account.id, phone: target.phone, error: err.message }, 'Send failed');
+                logger.error({ 
+                    accountId: account.id, 
+                    phone: target.phone, 
+                    error: err.message 
+                }, '❌ Send failed');
 
                 await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                     status: 'failed',
@@ -583,7 +758,9 @@ async function runCampaign(campaignId) {
                     failedCount: (campaign.failedCount || 0) + 1
                 });
 
+                // Handle logged out accounts
                 if (err.message?.includes('logged out') || err.message?.includes('disconnected')) {
+                    logger.warn({ accountId: account.id }, 'Account logged out, cleaning up');
                     await db.ref('whatsapp_accounts/' + account.id).update({
                         status: 'logged_out',
                         updatedAt: admin.database.ServerValue.TIMESTAMP
@@ -597,13 +774,17 @@ async function runCampaign(campaignId) {
 
             accountIndex++;
             
-            // ✅ RANDOM DELAY 20-60 seconds (Anti-Ban)
-            const randomDelay = Math.floor(Math.random() * 40000) + 20000;
-            logger.info({ campaignId, delay: (randomDelay/1000).toFixed(1) }, '⏳ Waiting before next message');
+            // ✅ RANDOM DELAY 30-60 seconds (Anti-Ban)
+            const randomDelay = Math.floor(Math.random() * 30000) + 30000;
+            logger.info({ 
+                campaignId, 
+                delay: (randomDelay/1000).toFixed(1) + 's',
+                nextAccountIndex: accountIndex % availableAccounts.length
+            }, '⏳ Anti-ban delay');
             await delay(randomDelay);
         }
 
-        // Check if completed
+        // ✅ Check if completed after processing batch
         const pendingSnap = await db.ref('campaign_targets/' + campaignId)
             .orderByChild('status')
             .equalTo('pending')
@@ -624,22 +805,34 @@ async function runCampaign(campaignId) {
                     type: 'campaign_completed',
                     title: '🎉 Campaign Completed!',
                     message: `Campaign "${campaign.name}" has been completed. ${campaign.sentCount} messages sent.`,
+                    campaignId: campaignId,
                     read: false,
                     createdAt: admin.database.ServerValue.TIMESTAMP
                 });
             }
+        } else {
+            // More targets remain, continue after delay
+            logger.info({ campaignId }, '🔄 More targets remaining, continuing...');
+            activeCampaigns.delete(campaignId);
+            await delay(5000);
+            runCampaign(campaignId);
+            return;
         }
+        
     } catch (err) {
-        logger.error({ campaignId, err }, '❌ Campaign error');
+        logger.error({ campaignId, err }, '❌ Campaign engine error');
         try {
             await db.ref('campaigns/' + campaignId).update({
                 status: 'error',
                 errorMessage: err.message,
                 errorAt: admin.database.ServerValue.TIMESTAMP
             });
-        } catch (e) {}
+        } catch (e) {
+            logger.error({ campaignId, error: e.message }, 'Failed to update campaign error status');
+        }
     } finally {
         activeCampaigns.delete(campaignId);
+        logger.info({ campaignId }, '🏁 Campaign engine finished cycle');
     }
 }
 
@@ -650,15 +843,26 @@ db.ref('campaigns').on('child_changed', (snapshot) => {
     const campaign = snapshot.val();
     const campaignId = snapshot.key;
     
-    // ✅ Only run if status changed TO running (not already running)
+    // Only run if status changed TO running (not already running)
     if (campaign.status === 'running' && !activeCampaigns.has(campaignId)) {
         logger.info({ campaignId }, '▶️ Campaign status changed to running');
+        
+        // Clear any existing retry timer
+        if (campaignRetryTimers.has(campaignId)) {
+            clearTimeout(campaignRetryTimers.get(campaignId));
+            campaignRetryTimers.delete(campaignId);
+        }
+        
         runCampaign(campaignId);
     }
     
-    // ✅ If paused/completed/error - just log, don't re-run
+    // If paused/completed/error - log and clean up retry timers
     if (campaign.status === 'paused' || campaign.status === 'completed' || campaign.status === 'error') {
         logger.info({ campaignId, status: campaign.status }, 'ℹ️ Campaign status updated');
+        if (campaignRetryTimers.has(campaignId)) {
+            clearTimeout(campaignRetryTimers.get(campaignId));
+            campaignRetryTimers.delete(campaignId);
+        }
     }
 });
 
@@ -862,10 +1066,7 @@ app.post('/api/campaign/start', async (req, res) => {
         // Save targets
         const targetUpdates = {};
         targets.forEach((t, idx) => {
-            let cleanPhone = String(t.phone).replace(/\D/g, '');
-            if (cleanPhone.startsWith('0')) cleanPhone = cleanPhone.slice(1);
-            if (!cleanPhone.startsWith('880')) cleanPhone = '880' + cleanPhone;
-            
+            const cleanPhone = cleanPhoneNumber(t.phone);
             targetUpdates['campaign_targets/' + campaignId + '/' + idx] = {
                 phone: cleanPhone,
                 name: t.name || '',
@@ -902,11 +1103,8 @@ app.post('/api/send', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Account not connected' });
         }
 
-        let cleanTo = String(to).replace(/\D/g, '');
-        if (cleanTo.startsWith('0')) cleanTo = cleanTo.slice(1);
-        if (!cleanTo.startsWith('880')) cleanTo = '880' + cleanTo;
-        
-        const jidTo = `${cleanTo}@s.whatsapp.net`;
+        const cleanTo = cleanPhoneNumber(to);
+        const jidTo = jid(cleanTo);
         const result = await sock.sendMessage(jidTo, { text });
 
         if (!result?.key?.id) {
@@ -932,12 +1130,96 @@ app.post('/api/send', async (req, res) => {
     }
 });
 
+// 7. ✅ NEW: Get campaign status
+app.get('/api/campaign/:id/status', async (req, res) => {
+    try {
+        const campaignSnap = await db.ref('campaigns/' + req.params.id).once('value');
+        if (!campaignSnap.exists()) {
+            return res.status(404).json({ success: false, error: 'Campaign not found' });
+        }
+        
+        const campaign = campaignSnap.val();
+        
+        // Get progress
+        const progressSnap = await db.ref('campaign_progress/' + req.params.id).once('value');
+        const progress = progressSnap.val() || {};
+        
+        const progressSummary = {};
+        Object.entries(progress).forEach(([key, val]) => {
+            if (val.accountId) {
+                progressSummary[val.accountId] = {
+                    sentCount: val.sentCount || 0,
+                    earned: val.earned || 0,
+                    status: val.status
+                };
+            }
+        });
+        
+        res.json({
+            success: true,
+            campaign: {
+                ...campaign,
+                id: req.params.id,
+                isRunning: activeCampaigns.has(req.params.id),
+                progress: progressSummary
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// 8. ✅ NEW: Pause campaign
+app.post('/api/campaign/:id/pause', async (req, res) => {
+    try {
+        await db.ref('campaigns/' + req.params.id).update({
+            status: 'paused',
+            pausedAt: admin.database.ServerValue.TIMESTAMP
+        });
+        
+        // Clear retry timer if exists
+        if (campaignRetryTimers.has(req.params.id)) {
+            clearTimeout(campaignRetryTimers.get(req.params.id));
+            campaignRetryTimers.delete(req.params.id);
+        }
+        
+        res.json({ success: true, message: 'Campaign paused' });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// 9. ✅ NEW: Resume campaign
+app.post('/api/campaign/:id/resume', async (req, res) => {
+    try {
+        await db.ref('campaigns/' + req.params.id).update({
+            status: 'running',
+            resumedAt: admin.database.ServerValue.TIMESTAMP
+        });
+        
+        // Clear any existing retry timer
+        if (campaignRetryTimers.has(req.params.id)) {
+            clearTimeout(campaignRetryTimers.get(req.params.id));
+            campaignRetryTimers.delete(req.params.id);
+        }
+        
+        // Start campaign if not already running
+        if (!activeCampaigns.has(req.params.id)) {
+            runCampaign(req.params.id);
+        }
+        
+        res.json({ success: true, message: 'Campaign resumed' });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // ============================================
 // MIDNIGHT CRON (reset todaySent)
 // ============================================
 cron.schedule('0 0 * * *', async () => {
     try {
-        console.log('🕛 Midnight reset');
+        console.log('🕛 Midnight reset - clearing daily counts');
         todayCounts.clear();
         
         const snap = await db.ref('whatsapp_accounts').once('value');
@@ -947,7 +1229,15 @@ cron.schedule('0 0 * * *', async () => {
         });
         await db.ref().update(updates);
         
-        logger.info('✅ Daily counts reset');
+        // Also reset user daily stats
+        const usersSnap = await db.ref('users').once('value');
+        const userUpdates = {};
+        usersSnap.forEach((child) => {
+            userUpdates['users/' + child.key + '/todayTotalSent'] = 0;
+        });
+        await db.ref().update(userUpdates);
+        
+        logger.info('✅ Daily counts reset successfully');
     } catch (err) {
         logger.error({ err }, 'Midnight reset error');
     }
@@ -957,20 +1247,38 @@ cron.schedule('0 0 * * *', async () => {
 });
 
 // ============================================
-// AUTO-SAVE SESSIONS
+// AUTO-SAVE SESSIONS (every 5 minutes)
 // ============================================
 setInterval(async () => {
     try {
+        let savedCount = 0;
         for (const sessionId of sessions.keys()) {
             if (sessionStates.get(sessionId)?.status === 'connected') {
                 await saveSessionToDB(sessionId);
+                savedCount++;
             }
         }
-        console.log('💾 Sessions auto-saved');
+        if (savedCount > 0) {
+            logger.info({ savedCount }, '💾 Sessions auto-saved');
+        }
     } catch (err) {
         logger.error({ err }, 'Auto-save error');
     }
 }, 300000);
+
+// ============================================
+// HEALTH CHECK - Keep alive for Render
+// ============================================
+setInterval(() => {
+    const connectedSessions = Array.from(sessionStates.values())
+        .filter(s => s.status === 'connected').length;
+    const runningCampaigns = activeCampaigns.size;
+    logger.info({ 
+        connectedSessions, 
+        runningCampaigns,
+        uptime: process.uptime().toFixed(0) + 's'
+    }, '❤️ Health check');
+}, 60000);
 
 // ============================================
 // LOAD SESSIONS ON STARTUP
@@ -982,12 +1290,14 @@ async function loadAllSessions() {
             .equalTo('connected')
             .once('value');
 
-        const sessions = [];
+        const sessionsToLoad = [];
         snap.forEach((child) => {
-            sessions.push({ id: child.key, ...child.val() });
+            sessionsToLoad.push({ id: child.key, ...child.val() });
         });
 
-        for (const data of sessions) {
+        logger.info({ count: sessionsToLoad.length }, '📂 Loading sessions...');
+
+        for (const data of sessionsToLoad) {
             const sessionId = data.id;
             const loaded = await loadSessionFromDB(sessionId);
 
@@ -1000,18 +1310,25 @@ async function loadAllSessions() {
                 await delay(3000);
             }
         }
-        logger.info(`✅ ${sessions.length} sessions loaded`);
+        logger.info(`✅ ${sessionsToLoad.length} sessions loaded`);
         
-        // Check for running campaigns
+        // Check for running campaigns after sessions are loaded
+        await delay(5000);
         const campaignsSnap = await db.ref('campaigns')
             .orderByChild('status')
             .equalTo('running')
             .once('value');
         
+        let resumedCount = 0;
         campaignsSnap.forEach((child) => {
             logger.info({ campaignId: child.key }, '▶️ Resuming campaign');
             runCampaign(child.key);
+            resumedCount++;
         });
+        
+        if (resumedCount > 0) {
+            logger.info({ resumedCount }, '✅ Campaigns resumed');
+        }
         
     } catch (err) {
         logger.error({ err }, 'Session load error');
@@ -1026,10 +1343,37 @@ app.get('*', (req, res) => {
 });
 
 // ============================================
+// GRACEFUL SHUTDOWN
+// ============================================
+process.on('SIGTERM', async () => {
+    console.log('🛑 SIGTERM received - shutting down gracefully');
+    
+    // Clear all retry timers
+    for (const [campaignId, timer] of campaignRetryTimers) {
+        clearTimeout(timer);
+    }
+    campaignRetryTimers.clear();
+    
+    // Save all sessions
+    for (const sessionId of sessions.keys()) {
+        if (sessionStates.get(sessionId)?.status === 'connected') {
+            await saveSessionToDB(sessionId);
+        }
+    }
+    
+    console.log('✅ Graceful shutdown complete');
+    process.exit(0);
+});
+
+// ============================================
 // START SERVER
 // ============================================
 app.listen(PORT, async () => {
-    console.log(`🚀 WS-Income Engine v3.0 on port ${PORT}`);
-    console.log(`📡 Firebase Realtime Database | Real-time Campaign Engine`);
+    console.log('═══════════════════════════════════════════');
+    console.log(`🚀 WS-Income Engine v3.2 on port ${PORT}`);
+    console.log('📡 Firebase Realtime Database');
+    console.log('🔧 Campaign Engine with Auto-Retry');
+    console.log('🌍 Timezone: Asia/Dhaka');
+    console.log('═══════════════════════════════════════════');
     await loadAllSessions();
 });
