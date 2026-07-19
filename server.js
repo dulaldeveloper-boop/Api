@@ -2,6 +2,7 @@
 // WS-INCOME WhatsApp Campaign Engine v4.0
 // Firebase Realtime Database | Real-time | Anti-Duplicate | Error Resilient
 // NEW: Referral System with Multi-Level Commission
+// NEW: Message Delivery Tracking with Payment Processing
 // ============================================
 
 const express = require('express');
@@ -70,6 +71,7 @@ const campaignListeners = new Map();
 const activeCampaigns = new Map();
 const campaignRetryTimers = new Map();
 const scheduledTimers = new Map();
+const messageDeliveryQueue = new Map(); // Track messages awaiting delivery verification
 
 // ============================================
 // EXPRESS SETUP
@@ -486,6 +488,153 @@ async function updateReferralStatus(userId) {
 }
 
 // ============================================
+// 🆕 MESSAGE DELIVERY PAYMENT PROCESSING
+// ============================================
+async function processMessageDeliveryPayment(msgId) {
+    try {
+        // Check if payment already processed
+        if (messageDeliveryQueue.has(msgId)) {
+            const queueData = messageDeliveryQueue.get(msgId);
+            if (queueData.processed) {
+                logger.info({ msgId }, '💰 Payment already processed, skipping');
+                return false;
+            }
+        }
+        
+        // Mark as processing
+        messageDeliveryQueue.set(msgId, { processed: true, timestamp: Date.now() });
+        
+        // Find message log
+        const logSnap = await db.ref('message_logs')
+            .orderByChild('messageId')
+            .equalTo(msgId)
+            .once('value');
+        
+        if (!logSnap.exists()) {
+            logger.warn({ msgId }, '⚠️ No log found for message');
+            return false;
+        }
+        
+        let logData = null;
+        let logKey = null;
+        
+        logSnap.forEach((child) => {
+            logData = child.val();
+            logKey = child.key;
+        });
+        
+        // Check if payment already added
+        if (logData.paymentAdded) {
+            logger.info({ msgId }, '💰 Payment already added in log');
+            return false;
+        }
+        
+        // Check if message was sent successfully
+        if (logData.status !== 'sent') {
+            logger.warn({ msgId, status: logData.status }, '⚠️ Message not in sent status');
+            return false;
+        }
+        
+        const { userId, campaignId, accountId, progressKey, pricePerMessage } = logData;
+        
+        // Get campaign price if not in log
+        let finalPrice = pricePerMessage || 0;
+        if (!finalPrice && campaignId) {
+            const campSnap = await db.ref('campaigns/' + campaignId).once('value');
+            const campaign = campSnap.val();
+            finalPrice = campaign?.pricePerMessage || 0;
+        }
+        
+        if (finalPrice > 0 && userId) {
+            // 💰 Add money to user
+            const updates = {};
+            updates['users/' + userId + '/balance'] = admin.database.ServerValue.increment(finalPrice);
+            updates['users/' + userId + '/totalEarned'] = admin.database.ServerValue.increment(finalPrice);
+            updates['users/' + userId + '/todayTotalSent'] = admin.database.ServerValue.increment(1);
+            updates['users/' + userId + '/totalSent'] = admin.database.ServerValue.increment(1);
+            
+            await db.ref().update(updates);
+            
+            // Update campaign progress
+            if (campaignId && progressKey) {
+                await db.ref('campaign_progress/' + campaignId + '/' + progressKey).update({
+                    earned: admin.database.ServerValue.increment(finalPrice),
+                    deliveredCount: admin.database.ServerValue.increment(1),
+                    updatedAt: admin.database.ServerValue.TIMESTAMP
+                });
+            }
+            
+            // Update campaign target status
+            if (campaignId) {
+                const targetSnap = await db.ref('campaign_targets/' + campaignId)
+                    .orderByChild('messageId')
+                    .equalTo(msgId)
+                    .once('value');
+                
+                targetSnap.forEach(async (targetChild) => {
+                    await db.ref('campaign_targets/' + campaignId + '/' + targetChild.key).update({
+                        verified: true,
+                        verifiedAt: admin.database.ServerValue.TIMESTAMP
+                    });
+                });
+                
+                // Update campaign delivered count
+                await db.ref('campaigns/' + campaignId).update({
+                    deliveredCount: admin.database.ServerValue.increment(1)
+                });
+            }
+            
+            // Process referral commissions
+            await updateReferralStatus(userId);
+            await calculateReferralBonus(userId, finalPrice);
+            
+            // Send notification to user
+            await db.ref('notifications').push().set({
+                userId: userId,
+                type: 'message_delivered',
+                title: '✅ Message Delivered!',
+                message: `Your message has been delivered successfully. Earned ৳${finalPrice}!`,
+                amount: finalPrice,
+                messageId: msgId,
+                read: false,
+                createdAt: admin.database.ServerValue.TIMESTAMP
+            });
+            
+            logger.info({ 
+                userId, 
+                amount: finalPrice, 
+                msgId,
+                campaignId 
+            }, '💰 Payment processed for delivered message');
+        } else {
+            logger.info({ msgId, userId, finalPrice }, 'ℹ️ No payment needed (price is 0 or no userId)');
+        }
+        
+        // Mark as paid in message log
+        await db.ref('message_logs/' + logKey).update({
+            deliveryStatus: 'DELIVERED',
+            statusUpdatedAt: admin.database.ServerValue.TIMESTAMP,
+            paymentAdded: true,
+            paymentAmount: finalPrice,
+            paymentProcessedAt: admin.database.ServerValue.TIMESTAMP
+        });
+        
+        // Clean up queue after 1 hour
+        setTimeout(() => {
+            messageDeliveryQueue.delete(msgId);
+        }, 3600000);
+        
+        return true;
+        
+    } catch (err) {
+        logger.error({ msgId, err }, '❌ Process delivery payment error');
+        // Remove from queue to allow retry
+        messageDeliveryQueue.delete(msgId);
+        return false;
+    }
+}
+
+// ============================================
 // 🆕 SCHEDULED CAMPAIGN START FUNCTION
 // ============================================
 function scheduleCampaignStart(campaignId, startTime) {
@@ -764,15 +913,46 @@ async function createSession(sessionId, phoneNumber) {
             }
         });
 
-        // 🆕 Message status listener
-        sock.ev.on('messages.update', (updates) => {
+        // ✅ ENHANCED MESSAGE DELIVERY TRACKER
+        sock.ev.on('messages.update', async (updates) => {
             for (const update of updates) {
-                const status = update.update?.status;
-                if (status) {
-                    logger.info({ 
-                        messageId: update.key.id,
-                        status: status === 3 ? 'delivered' : status === 4 ? 'read' : status 
-                    }, '📊 Message status update');
+                try {
+                    const msgId = update.key.id;
+                    const status = update.update?.status;
+                    
+                    if (!msgId) continue;
+                    
+                    // Status mapping
+                    const statusMap = {
+                        0: 'ERROR',
+                        1: 'PENDING',
+                        2: 'SERVER_ACK',      // WhatsApp server-এ পৌঁছেছে
+                        3: 'DELIVERY_ACK',    // রিসিভারের ফোনে পৌঁছেছে ✅
+                        4: 'READ'             // রিসিভার দেখেছে
+                    };
+                    
+                    const statusText = statusMap[status] || 'UNKNOWN';
+                    logger.info({ msgId, status: statusText }, '📊 Message status update');
+                    
+                    // ✅ DELIVERY_ACK বা READ হলে টাকা যোগ
+                    if (status >= 3) {
+                        await processMessageDeliveryPayment(msgId);
+                    } else if (status === 2) {
+                        // Update log with server ack status
+                        const logSnap = await db.ref('message_logs')
+                            .orderByChild('messageId')
+                            .equalTo(msgId)
+                            .once('value');
+                        
+                        logSnap.forEach(async (child) => {
+                            await db.ref('message_logs/' + child.key).update({
+                                deliveryStatus: statusText,
+                                statusUpdatedAt: admin.database.ServerValue.TIMESTAMP
+                            });
+                        });
+                    }
+                } catch (err) {
+                    logger.error({ err }, '❌ Delivery tracker error');
                 }
             }
         });
@@ -837,7 +1017,7 @@ async function checkAndRunCampaigns(userId) {
 }
 
 // ============================================
-// ✅ CAMPAIGN ENGINE v4.0
+// ✅ CAMPAIGN ENGINE v4.0 (With Delivery Tracking)
 // ============================================
 async function runCampaign(campaignId) {
     if (activeCampaigns.has(campaignId)) {
@@ -1107,17 +1287,19 @@ async function runCampaign(campaignId) {
                 
                 const result = await sock.sendMessage(jidTarget, { text: msg });
 
-                console.log('Message Result:', JSON.stringify(result));
-
                 if (result?.key?.id) {
-                    // SUCCESS
+                    const msgId = result.key.id;
+                    
+                    // 📝 Target status update - PENDING VERIFICATION
                     await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                         status: 'sent',
                         sentAt: admin.database.ServerValue.TIMESTAMP,
-                        messageId: result.key.id,
-                        sentBy: account.id
+                        messageId: msgId,
+                        sentBy: account.id,
+                        verified: false  // ❌ এখনো verify হয়নি
                     });
 
+                    // Campaign sent count update
                     const newSentCount = (campaign.sentCount || 0) + 1;
                     await db.ref('campaigns/' + campaignId).update({
                         sentCount: newSentCount,
@@ -1125,6 +1307,7 @@ async function runCampaign(campaignId) {
                     });
                     campaign.sentCount = newSentCount;
 
+                    // Account daily count update
                     const newCount = currentCount + 1;
                     todayCounts.set(account.id, newCount);
                     await db.ref('whatsapp_accounts/' + account.id).update({
@@ -1133,31 +1316,61 @@ async function runCampaign(campaignId) {
                         updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
-                    // Update user balance and handle referral commissions
-                    if (campaign.pricePerMessage > 0 && userId) {
-                        const userSnap = await db.ref('users/' + userId).once('value');
-                        const userData = userSnap.val() || {};
-                        await db.ref('users/' + userId).update({
-                            balance: (userData.balance || 0) + campaign.pricePerMessage,
-                            totalEarned: (userData.totalEarned || 0) + campaign.pricePerMessage,
-                            todayTotalSent: (userData.todayTotalSent || 0) + 1,
-                            updatedAt: admin.database.ServerValue.TIMESTAMP
-                        });
-
-                        // 🆕 Check and process referral commissions
-                        await updateReferralStatus(userId);
-                        await calculateReferralBonus(userId, campaign.pricePerMessage);
-                    }
-
+                    // Campaign progress update (temporary, payment পরে হবে)
                     const progressPath = 'campaign_progress/' + campaignId + '/' + account.progressKey;
                     await db.ref(progressPath).update({
                         sentCount: admin.database.ServerValue.increment(1),
-                        earned: admin.database.ServerValue.increment(campaign.pricePerMessage || 0),
                         lastSentAt: admin.database.ServerValue.TIMESTAMP,
                         updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
-                    console.log(`✅ [${account.phone}] Sent to ${targetPhone} (${newSentCount}/${campaign.totalTargets})`);
+                    // 📋 Message log save (for delivery tracking)
+                    const logRef = db.ref('message_logs').push();
+                    await logRef.set({
+                        campaignId: campaignId,
+                        userId: userId,
+                        accountId: account.id,
+                        targetPhone: targetPhone,
+                        targetName: target.name || '',
+                        messageId: msgId,
+                        messageText: msg,
+                        status: 'sent',
+                        deliveryStatus: 'PENDING',
+                        paymentAdded: false,  // ❌ এখনো টাকা দেয়নি
+                        progressKey: account.progressKey,
+                        pricePerMessage: campaign.pricePerMessage || 0,
+                        sentAt: admin.database.ServerValue.TIMESTAMP,
+                        statusUpdatedAt: null
+                    });
+
+                    console.log(`📤 [${account.phone}] Sent to ${targetPhone} - MsgID: ${msgId} (Pending verification)`);
+
+                    // ⏳ 30 seconds wait then verify
+                    await delay(30000);
+                    
+                    // 🔍 Verify message delivery status
+                    const verifySnap = await db.ref('message_logs')
+                        .orderByChild('messageId')
+                        .equalTo(msgId)
+                        .once('value');
+                    
+                    let isDelivered = false;
+                    verifySnap.forEach((child) => {
+                        if (child.val().paymentAdded) {
+                            isDelivered = true;
+                        }
+                    });
+                    
+                    if (isDelivered) {
+                        console.log(`✅ Verified delivered: ${targetPhone}`);
+                        await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
+                            verified: true,
+                            verifiedAt: admin.database.ServerValue.TIMESTAMP
+                        });
+                    } else {
+                        console.log(`⏳ Delivery pending: ${targetPhone} (will be tracked by listener)`);
+                    }
+
                 } else {
                     logger.warn({ accountId: account.id, target: targetPhone }, 'No message ID returned');
                     await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
@@ -1166,7 +1379,7 @@ async function runCampaign(campaignId) {
                     });
                     
                     await db.ref('campaigns/' + campaignId).update({
-                        failedCount: (campaign.failedCount || 0) + 1
+                        failedCount: admin.database.ServerValue.increment(1)
                     });
                 }
 
@@ -1183,7 +1396,7 @@ async function runCampaign(campaignId) {
                 });
 
                 await db.ref('campaigns/' + campaignId).update({
-                    failedCount: (campaign.failedCount || 0) + 1
+                    failedCount: admin.database.ServerValue.increment(1)
                 });
 
                 if (err.message?.includes('logged out') || err.message?.includes('disconnected')) {
@@ -1210,6 +1423,7 @@ async function runCampaign(campaignId) {
             await delay(randomDelay);
         }
 
+        // Check for more pending targets
         const pendingSnap = await db.ref('campaign_targets/' + campaignId)
             .orderByChild('status')
             .equalTo('pending')
@@ -1508,6 +1722,7 @@ app.post('/api/campaign/start', async (req, res) => {
             totalTargets: targets.length,
             sentCount: 0,
             failedCount: 0,
+            deliveredCount: 0,
             status: scheduledTime ? 'paused' : 'running',
             pricePerMessage: pricePerMessage || 0,
             scheduledStartTime: scheduledTime,
@@ -1522,6 +1737,7 @@ app.post('/api/campaign/start', async (req, res) => {
                 phone: cleanPhone,
                 name: t.name || '',
                 status: 'pending',
+                verified: false,
                 createdAt: now
             };
         });
@@ -1575,7 +1791,7 @@ app.post('/api/campaign/start', async (req, res) => {
     }
 });
 
-// 6. SEND SINGLE MESSAGE
+// 6. SEND SINGLE MESSAGE (with delivery tracking)
 app.post('/api/send', async (req, res) => {
     try {
         const { accountId, to, text, userId } = req.body;
@@ -1592,11 +1808,13 @@ app.post('/api/send', async (req, res) => {
         const cleanTo = cleanPhoneNumber(to);
         const jidTo = jid(cleanTo);
         const result = await sock.sendMessage(jidTo, { text });
+        const msgId = result?.key?.id;
 
-        if (!result?.key?.id) {
+        if (!msgId) {
             return res.status(400).json({ success: false, error: 'Message not confirmed' });
         }
 
+        // Account daily count update
         const newCount = (todayCounts.get(accountId) || 0) + 1;
         todayCounts.set(accountId, newCount);
         await db.ref('whatsapp_accounts/' + accountId).update({
@@ -1604,19 +1822,31 @@ app.post('/api/send', async (req, res) => {
             updatedAt: admin.database.ServerValue.TIMESTAMP
         });
 
+        // Message log save with delivery tracking
         await db.ref('message_logs').push().set({
-            accountId, userId: userId || '', to: jidTo, text,
-            status: 'sent', messageId: result.key.id,
-            createdAt: admin.database.ServerValue.TIMESTAMP
+            accountId, 
+            userId: userId || '', 
+            targetPhone: cleanTo,
+            messageId: msgId,
+            messageText: text,
+            status: 'sent',
+            deliveryStatus: 'PENDING',
+            paymentAdded: false,
+            sentAt: admin.database.ServerValue.TIMESTAMP
         });
 
-        res.json({ success: true, messageId: result.key.id, todaySent: newCount });
+        res.json({ 
+            success: true, 
+            messageId: msgId, 
+            todaySent: newCount,
+            message: 'Message sent. Delivery verification in progress.'
+        });
     } catch (err) {
         res.status(400).json({ success: false, error: err.message });
     }
 });
 
-// 7. GET CAMPAIGN STATUS
+// 7. GET CAMPAIGN STATUS (with delivered count)
 app.get('/api/campaign/:id/status', async (req, res) => {
     try {
         const campaignSnap = await db.ref('campaigns/' + req.params.id).once('value');
@@ -1629,11 +1859,19 @@ app.get('/api/campaign/:id/status', async (req, res) => {
         const progressSnap = await db.ref('campaign_progress/' + req.params.id).once('value');
         const progress = progressSnap.val() || {};
         
+        // Count delivered messages
+        const targetsSnap = await db.ref('campaign_targets/' + req.params.id).once('value');
+        let deliveredCount = 0;
+        targetsSnap.forEach(child => {
+            if (child.val().verified) deliveredCount++;
+        });
+        
         const progressSummary = {};
         Object.entries(progress).forEach(([key, val]) => {
             if (val.accountId) {
                 progressSummary[val.accountId] = {
                     sentCount: val.sentCount || 0,
+                    deliveredCount: val.deliveredCount || 0,
                     earned: val.earned || 0,
                     status: val.status
                 };
@@ -1651,6 +1889,7 @@ app.get('/api/campaign/:id/status', async (req, res) => {
                 ...campaign,
                 id: req.params.id,
                 isRunning: activeCampaigns.has(req.params.id),
+                deliveredCount: deliveredCount,
                 progress: progressSummary,
                 timeRemaining: timeRemaining
             }
@@ -2011,6 +2250,41 @@ app.get('/api/referral/check/:userId', async (req, res) => {
     }
 });
 
+// 18. GET MESSAGE DELIVERY STATUS
+app.get('/api/message/:messageId/status', async (req, res) => {
+    try {
+        const messageId = req.params.messageId;
+        
+        const logSnap = await db.ref('message_logs')
+            .orderByChild('messageId')
+            .equalTo(messageId)
+            .once('value');
+        
+        if (!logSnap.exists()) {
+            return res.status(404).json({ success: false, error: 'Message not found' });
+        }
+        
+        let messageData = null;
+        logSnap.forEach(child => {
+            messageData = {
+                id: child.key,
+                ...child.val()
+            };
+        });
+        
+        res.json({
+            success: true,
+            message: {
+                ...messageData,
+                isDelivered: messageData.paymentAdded || false,
+                deliveryStatus: messageData.deliveryStatus || 'UNKNOWN'
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // ============================================
 // MIDNIGHT CRON (reset todaySent)
 // ============================================
@@ -2235,6 +2509,9 @@ process.on('SIGTERM', async () => {
     }
     scheduledTimers.clear();
     
+    // Clear message delivery queue
+    messageDeliveryQueue.clear();
+    
     for (const sessionId of sessions.keys()) {
         if (sessionStates.get(sessionId)?.status === 'connected') {
             await saveSessionToDB(sessionId);
@@ -2249,14 +2526,15 @@ process.on('SIGTERM', async () => {
 // START SERVER
 // ============================================
 app.listen(PORT, async () => {
-    await loadAllSessions();
     console.log('═══════════════════════════════════════════');
     console.log(`🚀 WS-Income Engine v4.0 on port ${PORT}`);
     console.log('📡 Firebase Realtime Database');
     console.log('🔧 Campaign Engine with Auto-Start Timer');
     console.log('👥 Multi-Level Referral System');
     console.log('⏰ Scheduled Campaign Support');
+    console.log('📬 Message Delivery Tracking with Payment');
+    console.log('💰 Automatic Payment on Delivery Confirmation');
     console.log('🌍 Timezone: Asia/Dhaka');
     console.log('═══════════════════════════════════════════');
-    
+    await loadAllSessions();
 });
