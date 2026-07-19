@@ -1275,17 +1275,61 @@ async function runCampaign(campaignId) {
                 const targetPhone = cleanPhoneNumber(target.phone);
                 const jidTarget = jid(targetPhone);
                 
+                // Prepare campaign message template
                 const msg = messageTemplate
                     .replace(/\{name\}/g, target.name || 'Friend')
                     .replace(/\{phone\}/g, targetPhone || '');
                 
+                logger.info({ accountId: account.id, target: targetPhone }, '🔍 Checking if number is on WhatsApp');
+                
+                // 1. Check if number is on WhatsApp
+                const [waResult] = await sock.onWhatsApp(jidTarget);
+                
+                if (!waResult || !waResult.exists) {
+                    logger.warn(`❌ Number not on WA: ${targetPhone}`);
+                    
+                    // Update failed status in database
+                    await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
+                        status: 'failed',
+                        error: 'Not a WhatsApp account',
+                        failedAt: admin.database.ServerValue.TIMESTAMP
+                    });
+                    
+                    // Update campaign failed count
+                    await db.ref('campaigns/' + campaignId).update({
+                        failedCount: admin.database.ServerValue.increment(1)
+                    });
+                    
+                    accountIndex++;
+                    continue; // Move to next number
+                }
+
+                // Verified JID (returned from WhatsApp)
+                const verifiedJid = waResult.jid;
+
+                // 2. Simulate human activity (typing...)
+                logger.info({ target: targetPhone }, '✍️ Simulating human typing...');
+                
+                // presenceSubscribe ensures typing status reaches the receiver
+                await sock.presenceSubscribe(verifiedJid);
+                await sock.sendPresenceUpdate('composing', verifiedJid);
+                
+                // Dynamic typing delay (longer message = more typing time, max 5 seconds)
+                // 50ms per character, minimum 2 seconds
+                const typingDuration = Math.max(2000, Math.min(msg.length * 50, 5000));
+                await delay(typingDuration);
+                
+                // Pause typing
+                await sock.sendPresenceUpdate('paused', verifiedJid);
+
+                // 3. Send the campaign template message
                 logger.info({ 
                     accountId: account.id, 
                     target: targetPhone,
                     name: target.name 
-                }, '📤 Sending message');
+                }, '📤 Sending verified message');
                 
-                const result = await sock.sendMessage(jidTarget, { text: msg });
+                const result = await sock.sendMessage(verifiedJid, { text: msg });
 
                 if (result?.key?.id) {
                     const msgId = result.key.id;
@@ -1296,7 +1340,7 @@ async function runCampaign(campaignId) {
                         sentAt: admin.database.ServerValue.TIMESTAMP,
                         messageId: msgId,
                         sentBy: account.id,
-                        verified: false  // ❌ এখনো verify হয়নি
+                        verified: false
                     });
 
                     // Campaign sent count update
@@ -1316,7 +1360,7 @@ async function runCampaign(campaignId) {
                         updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
-                    // Campaign progress update (temporary, payment পরে হবে)
+                    // Campaign progress update
                     const progressPath = 'campaign_progress/' + campaignId + '/' + account.progressKey;
                     await db.ref(progressPath).update({
                         sentCount: admin.database.ServerValue.increment(1),
@@ -1336,7 +1380,7 @@ async function runCampaign(campaignId) {
                         messageText: msg,
                         status: 'sent',
                         deliveryStatus: 'PENDING',
-                        paymentAdded: false,  // ❌ এখনো টাকা দেয়নি
+                        paymentAdded: false,
                         progressKey: account.progressKey,
                         pricePerMessage: campaign.pricePerMessage || 0,
                         sentAt: admin.database.ServerValue.TIMESTAMP,
@@ -1395,6 +1439,7 @@ async function runCampaign(campaignId) {
                     error: err.message
                 });
 
+                // Update campaign failed count
                 await db.ref('campaigns/' + campaignId).update({
                     failedCount: admin.database.ServerValue.increment(1)
                 });
@@ -1414,6 +1459,7 @@ async function runCampaign(campaignId) {
 
             accountIndex++;
             
+            // Anti-ban delay
             const randomDelay = Math.floor(Math.random() * 30000) + 30000;
             logger.info({ 
                 campaignId, 
