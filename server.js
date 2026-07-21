@@ -1,8 +1,7 @@
 // ============================================
-// WS-INCOME WhatsApp Campaign Engine v4.0
-// Firebase Realtime Database | Real-time | Anti-Duplicate | Error Resilient
-// NEW: Referral System with Multi-Level Commission
-// NEW: Message Delivery Tracking with Payment Processing
+// WS-INCOME WhatsApp Campaign Engine v5.0
+// Firebase Realtime Database | Event-Driven Architecture
+// Optimized: Minimal API Endpoints, Firebase Triggers for Automation
 // ============================================
 
 const express = require('express');
@@ -43,7 +42,7 @@ const logger = pino({
 });
 
 // ============================================
-// ✅ FIREBASE REALTIME DATABASE INIT
+// FIREBASE REALTIME DATABASE INIT
 // ============================================
 let db;
 try {
@@ -67,11 +66,10 @@ const sessionStates = new Map();
 const todayCounts = new Map();
 const dailyLimits = new Map();
 const sessionUserMap = new Map();
-const campaignListeners = new Map();
 const activeCampaigns = new Map();
 const campaignRetryTimers = new Map();
 const scheduledTimers = new Map();
-const messageDeliveryQueue = new Map(); // Track messages awaiting delivery verification
+const messageDeliveryQueue = new Map();
 
 // ============================================
 // EXPRESS SETUP
@@ -94,11 +92,7 @@ function validateUserId(req, res, next) {
     
     const protectedRoutes = [
         { method: 'POST', pattern: /^\/api\/send$/ },
-        { method: 'POST', pattern: /^\/api\/campaign\/start$/ },
-        { method: 'POST', pattern: /^\/api\/limit\/.*/ },
-        { method: 'GET', pattern: /^\/api\/notifications\/.*/ },
-        { method: 'POST', pattern: /^\/api\/campaign\/.*/ },
-        { method: 'POST', pattern: /^\/api\/referral\/.*/ }
+        { method: 'POST', pattern: /^\/api\/campaign\/start$/ }
     ];
     
     const isProtected = protectedRoutes.some(route => 
@@ -152,14 +146,13 @@ function generateReferralCode() {
 }
 
 // ============================================
-// 🆕 REFERRAL SYSTEM FUNCTIONS
+// REFERRAL SYSTEM LOGIC (Triggered by Firebase Events)
 // ============================================
 
 async function initializeReferralSystem() {
     try {
         const settingsSnap = await db.ref('app_settings/referral_settings').once('value');
         if (!settingsSnap.exists()) {
-            // Set default referral settings
             await db.ref('app_settings/referral_settings').set({
                 conditionType: "withdrawal",
                 conditionValue: 1,
@@ -191,7 +184,6 @@ async function generateUserReferralCode(userId) {
         const userData = userSnap.val();
         if (userData.referralCode) return userData.referralCode;
         
-        // Generate unique referral code
         let referralCode;
         let isUnique = false;
         let attempts = 0;
@@ -213,13 +205,11 @@ async function generateUserReferralCode(userId) {
             throw new Error('Failed to generate unique referral code');
         }
         
-        // Save referral code to user
         await db.ref('users/' + userId).update({
             referralCode: referralCode,
             updatedAt: admin.database.ServerValue.TIMESTAMP
         });
         
-        // Initialize referral stats if not exists
         if (!userData.referralStats) {
             await db.ref('users/' + userId + '/referralStats').set({
                 totalReferred: 0,
@@ -243,7 +233,6 @@ async function generateUserReferralCode(userId) {
 
 async function processReferral(newUserId, referralCode) {
     try {
-        // Find referrer by referral code
         const referrerSnap = await db.ref('users')
             .orderByChild('referralCode')
             .equalTo(referralCode)
@@ -259,20 +248,17 @@ async function processReferral(newUserId, referralCode) {
             referrerId = child.key;
         });
         
-        // Prevent self-referral
         if (referrerId === newUserId) {
             logger.warn({ newUserId }, '⚠️ Self-referral prevented');
             return false;
         }
         
-        // Check if already referred
         const existingRefSnap = await db.ref('referrals/' + newUserId).once('value');
         if (existingRefSnap.exists()) {
             logger.warn({ newUserId }, '⚠️ User already referred');
             return false;
         }
         
-        // Create referral record
         const referralData = {
             referrerId: referrerId,
             referredUserId: newUserId,
@@ -287,7 +273,6 @@ async function processReferral(newUserId, referralCode) {
         
         await db.ref('referrals/' + newUserId).set(referralData);
         
-        // Update referrer stats
         const statsSnap = await db.ref('users/' + referrerId + '/referralStats').once('value');
         const stats = statsSnap.val() || {};
         
@@ -298,7 +283,6 @@ async function processReferral(newUserId, referralCode) {
         updates['users/' + referrerId + '/referralStats/updatedAt'] = admin.database.ServerValue.TIMESTAMP;
         await db.ref().update(updates);
         
-        // Set referrer in new user's profile
         await db.ref('users/' + newUserId).update({
             referredBy: referrerId,
             referralCode: referralCode,
@@ -329,14 +313,9 @@ async function calculateReferralBonus(referredUserId, earnedAmount) {
         await db.ref('users/' + ref.referrerId + '/totalEarned').transaction(bal => (bal || 0) + l1Bonus);
         await db.ref('users/' + ref.referrerId + '/referralStats/totalBonusEarned').transaction(bal => (bal || 0) + l1Bonus);
         
-        logger.info({ 
-            referrerId: ref.referrerId, 
-            referredUserId, 
-            bonus: l1Bonus,
-            level: 1 
-        }, '💰 Level 1 commission paid');
+        logger.info({ referrerId: ref.referrerId, referredUserId, bonus: l1Bonus, level: 1 }, '💰 Level 1 commission paid');
 
-        // Level 2 Commission (referrer's referrer)
+        // Level 2 Commission
         const ref2Snap = await db.ref('referrals/' + ref.referrerId).once('value');
         const ref2 = ref2Snap.val();
         if (ref2 && ref2.status === 'successful') {
@@ -345,12 +324,7 @@ async function calculateReferralBonus(referredUserId, earnedAmount) {
             await db.ref('users/' + ref2.referrerId + '/totalEarned').transaction(bal => (bal || 0) + l2Bonus);
             await db.ref('users/' + ref2.referrerId + '/referralStats/totalBonusEarned').transaction(bal => (bal || 0) + l2Bonus);
             
-            logger.info({ 
-                referrerId: ref2.referrerId, 
-                referredUserId,
-                bonus: l2Bonus,
-                level: 2 
-            }, '💰 Level 2 commission paid');
+            logger.info({ referrerId: ref2.referrerId, referredUserId, bonus: l2Bonus, level: 2 }, '💰 Level 2 commission paid');
 
             // Level 3 Commission
             const ref3Snap = await db.ref('referrals/' + ref2.referrerId).once('value');
@@ -361,16 +335,10 @@ async function calculateReferralBonus(referredUserId, earnedAmount) {
                 await db.ref('users/' + ref3.referrerId + '/totalEarned').transaction(bal => (bal || 0) + l3Bonus);
                 await db.ref('users/' + ref3.referrerId + '/referralStats/totalBonusEarned').transaction(bal => (bal || 0) + l3Bonus);
                 
-                logger.info({ 
-                    referrerId: ref3.referrerId, 
-                    referredUserId,
-                    bonus: l3Bonus,
-                    level: 3 
-                }, '💰 Level 3 commission paid');
+                logger.info({ referrerId: ref3.referrerId, referredUserId, bonus: l3Bonus, level: 3 }, '💰 Level 3 commission paid');
             }
         }
 
-        // Check Level Bonus Milestones
         await checkReferralMilestones(ref.referrerId, settings);
         
     } catch (err) {
@@ -391,13 +359,11 @@ async function checkReferralMilestones(userId, settings) {
         for (const [count, bonus] of Object.entries(levelBonuses)) {
             const requiredCount = parseInt(count);
             if (totalRefs >= requiredCount && !achievedMilestones[count]) {
-                // Pay milestone bonus
                 await db.ref('users/' + userId + '/balance').transaction(bal => (bal || 0) + bonus);
                 await db.ref('users/' + userId + '/totalEarned').transaction(bal => (bal || 0) + bonus);
                 await db.ref('users/' + userId + '/referralStats/totalBonusEarned').transaction(bal => (bal || 0) + bonus);
                 await db.ref('users/' + userId + '/referralStats/achievedMilestones/' + count).set(true);
                 
-                // Send notification
                 await db.ref('notifications').push().set({
                     userId: userId,
                     type: 'referral_milestone',
@@ -412,10 +378,6 @@ async function checkReferralMilestones(userId, settings) {
                 logger.info({ userId, milestone: requiredCount, bonus }, '🏆 Referral milestone achieved');
             }
         }
-        
-        // Check monthly top referrer bonus (runs at end of month via cron)
-        await db.ref('users/' + userId + '/referralStats/monthlyBonus').transaction(bal => (bal || 0) + 0);
-        
     } catch (err) {
         logger.error({ userId, err }, '❌ Check milestones error');
     }
@@ -432,12 +394,11 @@ async function updateReferralStatus(userId) {
         if (!refSnap.exists()) return;
         
         const ref = refSnap.val();
-        if (ref.status === 'successful') return; // Already successful
+        if (ref.status === 'successful') return;
         
         let conditionMet = false;
         
         if (settings.conditionType === 'withdrawal') {
-            // Check if user has made required withdrawals
             const withdrawalsSnap = await db.ref('withdrawals')
                 .orderByChild('userId')
                 .equalTo(userId)
@@ -451,28 +412,23 @@ async function updateReferralStatus(userId) {
             });
             
             conditionMet = successCount >= settings.conditionValue;
-            
         } else if (settings.conditionType === 'messageCount') {
-            // Check if user has sent required messages
             const userSnap = await db.ref('users/' + userId).once('value');
             const userData = userSnap.val() || {};
             conditionMet = (userData.totalSent || 0) >= settings.conditionValue;
         }
         
         if (conditionMet && ref.status === 'active') {
-            // Update referral status to successful
             await db.ref('referrals/' + userId).update({
                 status: 'successful',
                 successfulAt: admin.database.ServerValue.TIMESTAMP
             });
             
-            // Update referrer stats
             const updates = {};
             updates['users/' + ref.referrerId + '/referralStats/successfulReferred'] = admin.database.ServerValue.increment(1);
             updates['users/' + ref.referrerId + '/referralStats/activeReferred'] = admin.database.ServerValue.increment(-1);
             await db.ref().update(updates);
             
-            // Calculate initial bonus if user earned something
             const userSnap = await db.ref('users/' + userId).once('value');
             const userData = userSnap.val() || {};
             if (userData.totalEarned > 0) {
@@ -481,18 +437,16 @@ async function updateReferralStatus(userId) {
             
             logger.info({ userId, referrerId: ref.referrerId }, '✅ Referral status updated to successful');
         }
-        
     } catch (err) {
         logger.error({ userId, err }, '❌ Update referral status error');
     }
 }
 
 // ============================================
-// 🆕 MESSAGE DELIVERY PAYMENT PROCESSING
+// MESSAGE DELIVERY & PAYMENT LOGIC
 // ============================================
 async function processMessageDeliveryPayment(msgId) {
     try {
-        // Check if payment already processed
         if (messageDeliveryQueue.has(msgId)) {
             const queueData = messageDeliveryQueue.get(msgId);
             if (queueData.processed) {
@@ -501,10 +455,8 @@ async function processMessageDeliveryPayment(msgId) {
             }
         }
         
-        // Mark as processing
         messageDeliveryQueue.set(msgId, { processed: true, timestamp: Date.now() });
         
-        // Find message log
         const logSnap = await db.ref('message_logs')
             .orderByChild('messageId')
             .equalTo(msgId)
@@ -523,13 +475,11 @@ async function processMessageDeliveryPayment(msgId) {
             logKey = child.key;
         });
         
-        // Check if payment already added
         if (logData.paymentAdded) {
             logger.info({ msgId }, '💰 Payment already added in log');
             return false;
         }
         
-        // Check if message was sent successfully
         if (logData.status !== 'sent') {
             logger.warn({ msgId, status: logData.status }, '⚠️ Message not in sent status');
             return false;
@@ -537,7 +487,6 @@ async function processMessageDeliveryPayment(msgId) {
         
         const { userId, campaignId, accountId, progressKey, pricePerMessage } = logData;
         
-        // Get campaign price if not in log
         let finalPrice = pricePerMessage || 0;
         if (!finalPrice && campaignId) {
             const campSnap = await db.ref('campaigns/' + campaignId).once('value');
@@ -546,7 +495,6 @@ async function processMessageDeliveryPayment(msgId) {
         }
         
         if (finalPrice > 0 && userId) {
-            // 💰 Add money to user
             const updates = {};
             updates['users/' + userId + '/balance'] = admin.database.ServerValue.increment(finalPrice);
             updates['users/' + userId + '/totalEarned'] = admin.database.ServerValue.increment(finalPrice);
@@ -555,7 +503,6 @@ async function processMessageDeliveryPayment(msgId) {
             
             await db.ref().update(updates);
             
-            // Update campaign progress
             if (campaignId && progressKey) {
                 await db.ref('campaign_progress/' + campaignId + '/' + progressKey).update({
                     earned: admin.database.ServerValue.increment(finalPrice),
@@ -564,7 +511,6 @@ async function processMessageDeliveryPayment(msgId) {
                 });
             }
             
-            // Update campaign target status
             if (campaignId) {
                 const targetSnap = await db.ref('campaign_targets/' + campaignId)
                     .orderByChild('messageId')
@@ -578,17 +524,14 @@ async function processMessageDeliveryPayment(msgId) {
                     });
                 });
                 
-                // Update campaign delivered count
                 await db.ref('campaigns/' + campaignId).update({
                     deliveredCount: admin.database.ServerValue.increment(1)
                 });
             }
             
-            // Process referral commissions
             await updateReferralStatus(userId);
             await calculateReferralBonus(userId, finalPrice);
             
-            // Send notification to user
             await db.ref('notifications').push().set({
                 userId: userId,
                 type: 'message_delivered',
@@ -600,17 +543,11 @@ async function processMessageDeliveryPayment(msgId) {
                 createdAt: admin.database.ServerValue.TIMESTAMP
             });
             
-            logger.info({ 
-                userId, 
-                amount: finalPrice, 
-                msgId,
-                campaignId 
-            }, '💰 Payment processed for delivered message');
+            logger.info({ userId, amount: finalPrice, msgId, campaignId }, '💰 Payment processed for delivered message');
         } else {
             logger.info({ msgId, userId, finalPrice }, 'ℹ️ No payment needed (price is 0 or no userId)');
         }
         
-        // Mark as paid in message log
         await db.ref('message_logs/' + logKey).update({
             deliveryStatus: 'DELIVERED',
             statusUpdatedAt: admin.database.ServerValue.TIMESTAMP,
@@ -619,7 +556,6 @@ async function processMessageDeliveryPayment(msgId) {
             paymentProcessedAt: admin.database.ServerValue.TIMESTAMP
         });
         
-        // Clean up queue after 1 hour
         setTimeout(() => {
             messageDeliveryQueue.delete(msgId);
         }, 3600000);
@@ -628,14 +564,13 @@ async function processMessageDeliveryPayment(msgId) {
         
     } catch (err) {
         logger.error({ msgId, err }, '❌ Process delivery payment error');
-        // Remove from queue to allow retry
         messageDeliveryQueue.delete(msgId);
         return false;
     }
 }
 
 // ============================================
-// 🆕 SCHEDULED CAMPAIGN START FUNCTION
+// CAMPAIGN SCHEDULER
 // ============================================
 function scheduleCampaignStart(campaignId, startTime) {
     const delay = startTime - Date.now();
@@ -684,13 +619,7 @@ function scheduleCampaignStart(campaignId, startTime) {
         
         const minutes = Math.floor(delay / 60000);
         const hours = Math.floor(minutes / 60);
-        const remainingMinutes = minutes % 60;
-        
-        logger.info({ 
-            campaignId, 
-            delay: `${hours}h ${remainingMinutes}m`,
-            startTime: new Date(startTime).toISOString()
-        }, '🕒 Scheduled campaign auto-start');
+        logger.info({ campaignId, delay: `${hours}h ${minutes % 60}m` }, '🕒 Scheduled campaign auto-start');
     } else {
         logger.info({ campaignId }, '⏰ Scheduled time passed, starting immediately');
         db.ref('campaigns/' + campaignId).update({ 
@@ -723,7 +652,7 @@ async function rescheduleCampaigns() {
 }
 
 // ============================================
-// ✅ REALTIME DB SESSION SAVE/LOAD
+// FIREBASE SESSION PERSISTENCE
 // ============================================
 async function saveSessionToDB(sessionId) {
     try {
@@ -737,7 +666,6 @@ async function saveSessionToDB(sessionId) {
             const filePath = `${sessionPath}/${file}`;
             if (fs.statSync(filePath).isFile()) {
                 const content = fs.readFileSync(filePath, 'utf-8');
-                // Replace dots and special characters in filenames for Firebase
                 const safeKey = file.replace(/[.$#[\]/]/g, '_');
                 sessionData[safeKey] = content;
             }
@@ -913,7 +841,7 @@ async function createSession(sessionId, phoneNumber) {
             }
         });
 
-        // ✅ ENHANCED MESSAGE DELIVERY TRACKER
+        // ✅ CRITICAL: Message Delivery Tracking & Auto Payment
         sock.ev.on('messages.update', async (updates) => {
             for (const update of updates) {
                 try {
@@ -922,23 +850,21 @@ async function createSession(sessionId, phoneNumber) {
                     
                     if (!msgId) continue;
                     
-                    // Status mapping
                     const statusMap = {
                         0: 'ERROR',
                         1: 'PENDING',
-                        2: 'SERVER_ACK',      // WhatsApp server-এ পৌঁছেছে
-                        3: 'DELIVERY_ACK',    // রিসিভারের ফোনে পৌঁছেছে ✅
-                        4: 'READ'             // রিসিভার দেখেছে
+                        2: 'SERVER_ACK',
+                        3: 'DELIVERY_ACK',
+                        4: 'READ'
                     };
                     
                     const statusText = statusMap[status] || 'UNKNOWN';
                     logger.info({ msgId, status: statusText }, '📊 Message status update');
                     
-                    // ✅ DELIVERY_ACK বা READ হলে টাকা যোগ
+                    // Payment on delivery or read receipt
                     if (status >= 3) {
                         await processMessageDeliveryPayment(msgId);
                     } else if (status === 2) {
-                        // Update log with server ack status
                         const logSnap = await db.ref('message_logs')
                             .orderByChild('messageId')
                             .equalTo(msgId)
@@ -966,7 +892,7 @@ async function createSession(sessionId, phoneNumber) {
 }
 
 // ============================================
-// ✅ UPDATE USER DEVICE STATS
+// UPDATE USER DEVICE STATS (For Dashboard)
 // ============================================
 async function updateUserDeviceStats(userId) {
     try {
@@ -995,7 +921,7 @@ async function updateUserDeviceStats(userId) {
 }
 
 // ============================================
-// ✅ CHECK AND RUN CAMPAIGNS FOR USER
+// CAMPAIGN ENGINE (Core Logic)
 // ============================================
 async function checkAndRunCampaigns(userId) {
     try {
@@ -1016,9 +942,6 @@ async function checkAndRunCampaigns(userId) {
     }
 }
 
-// ============================================
-// ✅ CAMPAIGN ENGINE v4.0 (With Delivery Tracking)
-// ============================================
 async function runCampaign(campaignId) {
     if (activeCampaigns.has(campaignId)) {
         logger.info({ campaignId }, '⚠️ Campaign already running, skipping');
@@ -1157,7 +1080,6 @@ async function runCampaign(campaignId) {
             return;
         }
 
-        logger.info({ campaignId, joinedCount: joinedAccounts.length }, '🔍 Checking account availability...');
         const availableAccounts = [];
         
         for (const acc of joinedAccounts) {
@@ -1173,12 +1095,7 @@ async function runCampaign(campaignId) {
                 const sessionState = sessionStates.get(acc.accountId);
                 
                 if (!sessions.has(acc.accountId) || !sessionState || sessionState.status !== 'connected') {
-                    logger.warn({ 
-                        accountId: acc.accountId, 
-                        phone: device.phone,
-                        hasSession: sessions.has(acc.accountId),
-                        sessionStatus: sessionState?.status 
-                    }, '⚠️ Device not connected');
+                    logger.warn({ accountId: acc.accountId, phone: device.phone }, '⚠️ Device not connected');
                     
                     if (device.status !== 'logged_out') {
                         await db.ref('whatsapp_accounts/' + acc.accountId).update({
@@ -1193,11 +1110,7 @@ async function runCampaign(campaignId) {
                 const dailyLimit = dailyLimits.get(acc.accountId) || device.dailyLimit || 5;
                 
                 if (todaySent >= dailyLimit) {
-                    logger.info({ 
-                        accountId: acc.accountId, 
-                        todaySent, 
-                        dailyLimit 
-                    }, '📊 Daily limit reached');
+                    logger.info({ accountId: acc.accountId, todaySent, dailyLimit }, '📊 Daily limit reached');
                     continue;
                 }
                 
@@ -1228,13 +1141,6 @@ async function runCampaign(campaignId) {
             activeCampaigns.delete(campaignId);
             return;
         }
-
-        logger.info({ 
-            campaignId, 
-            joinedCount: joinedAccounts.length, 
-            availableCount: availableAccounts.length,
-            availablePhones: availableAccounts.map(a => a.phone)
-        }, '▶️ Campaign running with available accounts');
 
         let accountIndex = 0;
         const targets = [];
@@ -1275,66 +1181,50 @@ async function runCampaign(campaignId) {
                 const targetPhone = cleanPhoneNumber(target.phone);
                 const jidTarget = jid(targetPhone);
                 
-                // Prepare campaign message template
                 const msg = messageTemplate
                     .replace(/\{name\}/g, target.name || 'Friend')
                     .replace(/\{phone\}/g, targetPhone || '');
                 
                 logger.info({ accountId: account.id, target: targetPhone }, '🔍 Checking if number is on WhatsApp');
                 
-                // 1. Check if number is on WhatsApp
                 const [waResult] = await sock.onWhatsApp(jidTarget);
                 
                 if (!waResult || !waResult.exists) {
                     logger.warn(`❌ Number not on WA: ${targetPhone}`);
                     
-                    // Update failed status in database
                     await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                         status: 'failed',
                         error: 'Not a WhatsApp account',
                         failedAt: admin.database.ServerValue.TIMESTAMP
                     });
                     
-                    // Update campaign failed count
                     await db.ref('campaigns/' + campaignId).update({
                         failedCount: admin.database.ServerValue.increment(1)
                     });
                     
                     accountIndex++;
-                    continue; // Move to next number
+                    continue;
                 }
 
-                // Verified JID (returned from WhatsApp)
                 const verifiedJid = waResult.jid;
 
-                // 2. Simulate human activity (typing...)
                 logger.info({ target: targetPhone }, '✍️ Simulating human typing...');
                 
-                // presenceSubscribe ensures typing status reaches the receiver
                 await sock.presenceSubscribe(verifiedJid);
                 await sock.sendPresenceUpdate('composing', verifiedJid);
                 
-                // Dynamic typing delay (longer message = more typing time, max 5 seconds)
-                // 50ms per character, minimum 2 seconds
                 const typingDuration = Math.max(2000, Math.min(msg.length * 50, 5000));
                 await delay(typingDuration);
                 
-                // Pause typing
                 await sock.sendPresenceUpdate('paused', verifiedJid);
 
-                // 3. Send the campaign template message
-                logger.info({ 
-                    accountId: account.id, 
-                    target: targetPhone,
-                    name: target.name 
-                }, '📤 Sending verified message');
+                logger.info({ accountId: account.id, target: targetPhone, name: target.name }, '📤 Sending verified message');
                 
                 const result = await sock.sendMessage(verifiedJid, { text: msg });
 
                 if (result?.key?.id) {
                     const msgId = result.key.id;
                     
-                    // 📝 Target status update - PENDING VERIFICATION
                     await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                         status: 'sent',
                         sentAt: admin.database.ServerValue.TIMESTAMP,
@@ -1343,7 +1233,6 @@ async function runCampaign(campaignId) {
                         verified: false
                     });
 
-                    // Campaign sent count update
                     const newSentCount = (campaign.sentCount || 0) + 1;
                     await db.ref('campaigns/' + campaignId).update({
                         sentCount: newSentCount,
@@ -1351,7 +1240,6 @@ async function runCampaign(campaignId) {
                     });
                     campaign.sentCount = newSentCount;
 
-                    // Account daily count update
                     const newCount = currentCount + 1;
                     todayCounts.set(account.id, newCount);
                     await db.ref('whatsapp_accounts/' + account.id).update({
@@ -1360,7 +1248,6 @@ async function runCampaign(campaignId) {
                         updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
-                    // Campaign progress update
                     const progressPath = 'campaign_progress/' + campaignId + '/' + account.progressKey;
                     await db.ref(progressPath).update({
                         sentCount: admin.database.ServerValue.increment(1),
@@ -1368,7 +1255,6 @@ async function runCampaign(campaignId) {
                         updatedAt: admin.database.ServerValue.TIMESTAMP
                     });
 
-                    // 📋 Message log save (for delivery tracking)
                     const logRef = db.ref('message_logs').push();
                     await logRef.set({
                         campaignId: campaignId,
@@ -1389,10 +1275,9 @@ async function runCampaign(campaignId) {
 
                     console.log(`📤 [${account.phone}] Sent to ${targetPhone} - MsgID: ${msgId} (Pending verification)`);
 
-                    // ⏳ 30 seconds wait then verify
+                    // Wait for potential delivery confirmation
                     await delay(30000);
                     
-                    // 🔍 Verify message delivery status
                     const verifySnap = await db.ref('message_logs')
                         .orderByChild('messageId')
                         .equalTo(msgId)
@@ -1428,18 +1313,13 @@ async function runCampaign(campaignId) {
                 }
 
             } catch (err) {
-                logger.error({ 
-                    accountId: account.id, 
-                    phone: target.phone, 
-                    error: err.message 
-                }, '❌ Send failed');
+                logger.error({ accountId: account.id, phone: target.phone, error: err.message }, '❌ Send failed');
 
                 await db.ref('campaign_targets/' + campaignId + '/' + target.id).update({
                     status: 'failed',
                     error: err.message
                 });
 
-                // Update campaign failed count
                 await db.ref('campaigns/' + campaignId).update({
                     failedCount: admin.database.ServerValue.increment(1)
                 });
@@ -1459,17 +1339,11 @@ async function runCampaign(campaignId) {
 
             accountIndex++;
             
-            // Anti-ban delay
             const randomDelay = Math.floor(Math.random() * 30000) + 30000;
-            logger.info({ 
-                campaignId, 
-                delay: (randomDelay/1000).toFixed(1) + 's',
-                nextAccountIndex: accountIndex % availableAccounts.length
-            }, '⏳ Anti-ban delay');
+            logger.info({ campaignId, delay: (randomDelay/1000).toFixed(1) + 's' }, '⏳ Anti-ban delay');
             await delay(randomDelay);
         }
 
-        // Check for more pending targets
         const pendingSnap = await db.ref('campaign_targets/' + campaignId)
             .orderByChild('status')
             .equalTo('pending')
@@ -1525,8 +1399,10 @@ async function runCampaign(campaignId) {
 }
 
 // ============================================
-// ✅ LISTEN FOR CAMPAIGN CHANGES (REAL-TIME)
+// 🔥 FIREBASE EVENT LISTENERS (The Core Automation)
 // ============================================
+
+// 1. Campaign Status Changes (Pause/Resume/Start Detection)
 db.ref('campaigns').on('child_changed', (snapshot) => {
     const campaign = snapshot.val();
     const campaignId = snapshot.key;
@@ -1553,7 +1429,6 @@ db.ref('campaigns').on('child_changed', (snapshot) => {
     }
     
     if (campaign.status === 'paused' || campaign.status === 'completed' || campaign.status === 'error') {
-        logger.info({ campaignId, status: campaign.status }, 'ℹ️ Campaign status updated');
         if (campaignRetryTimers.has(campaignId)) {
             clearTimeout(campaignRetryTimers.get(campaignId));
             campaignRetryTimers.delete(campaignId);
@@ -1561,6 +1436,7 @@ db.ref('campaigns').on('child_changed', (snapshot) => {
     }
 });
 
+// 2. New Campaign Added (Immediate Start)
 db.ref('campaigns').on('child_added', (snapshot) => {
     const campaign = snapshot.val();
     const campaignId = snapshot.key;
@@ -1574,9 +1450,7 @@ db.ref('campaigns').on('child_added', (snapshot) => {
     }
 });
 
-// ============================================
-// 🆕 REFERRAL SYSTEM EVENT LISTENERS
-// ============================================
+// 3. Withdrawal Completion triggers Referral Status Update
 db.ref('withdrawals').on('child_changed', async (snapshot) => {
     const withdrawal = snapshot.val();
     if (withdrawal.status === 'completed' || withdrawal.status === 'successful') {
@@ -1584,8 +1458,40 @@ db.ref('withdrawals').on('child_changed', async (snapshot) => {
     }
 });
 
+// 4. New User Signup with Referral Code
+db.ref('users').on('child_added', async (snapshot) => {
+    const userData = snapshot.val();
+    const userId = snapshot.key;
+    
+    // Auto-process referral if user has a referral code that hasn't been processed yet
+    if (userData.referralCode && !userData.referralProcessed) {
+        const success = await processReferral(userId, userData.referralCode);
+        if (success) {
+            await db.ref('users/' + userId).update({ referralProcessed: true });
+        }
+    }
+    
+    // Auto-generate referral code for new users
+    if (!userData.referralCode) {
+        await generateUserReferralCode(userId);
+    }
+});
+
+// 5. User Balance Change triggers Referral Bonus (Real-time Commission)
+db.ref('users').on('child_changed', async (snapshot) => {
+    const userData = snapshot.val();
+    const userId = snapshot.key;
+    const beforeData = snapshot.previous.val();
+    
+    // Check if totalEarned has increased
+    if (userData && beforeData && userData.totalEarned > (beforeData?.totalEarned || 0)) {
+        const earnedAmount = userData.totalEarned - (beforeData?.totalEarned || 0);
+        await calculateReferralBonus(userId, earnedAmount);
+    }
+});
+
 // ============================================
-// API ENDPOINTS
+// 🚀 MINIMAL API ENDPOINTS (Only 5!)
 // ============================================
 
 // 1. PAIR - get pairing code
@@ -1683,7 +1589,7 @@ app.post('/api/pair', async (req, res) => {
     }
 });
 
-// 2. ACCOUNT STATUS
+// 2. ACCOUNT STATUS (Read Only - Mostly handled by Firebase Client SDK)
 app.get('/api/status/:id', (req, res) => {
     const state = sessionStates.get(req.params.id);
     if (!state) return res.json({ status: 'not_found' });
@@ -1726,28 +1632,60 @@ app.delete('/api/disconnect/:id', async (req, res) => {
     }
 });
 
-// 4. SET DAILY LIMIT
-app.post('/api/limit/:id', async (req, res) => {
+// 4. SEND SINGLE MESSAGE (with delivery tracking)
+app.post('/api/send', async (req, res) => {
     try {
-        const { limit } = req.body;
-        const parsedLimit = parseInt(limit);
+        const { accountId, to, text, userId } = req.body;
         
-        if (!limit || parsedLimit < 0) {
-            return res.status(400).json({ success: false, error: 'Invalid limit' });
+        if (!accountId || !to || !text) {
+            return res.status(400).json({ success: false, error: 'Missing fields' });
         }
 
-        dailyLimits.set(req.params.id, parsedLimit);
-        await db.ref('whatsapp_accounts/' + req.params.id).update({ 
-            dailyLimit: parsedLimit,
+        const sock = sessions.get(accountId);
+        if (!sock || sessionStates.get(accountId)?.status !== 'connected') {
+            return res.status(400).json({ success: false, error: 'Account not connected' });
+        }
+
+        const cleanTo = cleanPhoneNumber(to);
+        const jidTo = jid(cleanTo);
+        const result = await sock.sendMessage(jidTo, { text });
+        const msgId = result?.key?.id;
+
+        if (!msgId) {
+            return res.status(400).json({ success: false, error: 'Message not confirmed' });
+        }
+
+        const newCount = (todayCounts.get(accountId) || 0) + 1;
+        todayCounts.set(accountId, newCount);
+        await db.ref('whatsapp_accounts/' + accountId).update({
+            todaySent: newCount,
             updatedAt: admin.database.ServerValue.TIMESTAMP
         });
-        res.json({ success: true, dailyLimit: parsedLimit });
+
+        await db.ref('message_logs').push().set({
+            accountId, 
+            userId: userId || '', 
+            targetPhone: cleanTo,
+            messageId: msgId,
+            messageText: text,
+            status: 'sent',
+            deliveryStatus: 'PENDING',
+            paymentAdded: false,
+            sentAt: admin.database.ServerValue.TIMESTAMP
+        });
+
+        res.json({ 
+            success: true, 
+            messageId: msgId, 
+            todaySent: newCount,
+            message: 'Message sent. Delivery verification in progress.'
+        });
     } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
+        res.status(400).json({ success: false, error: err.message });
     }
 });
 
-// 5. START CAMPAIGN
+// 5. START CAMPAIGN (Creation only, execution is automatic via listener)
 app.post('/api/campaign/start', async (req, res) => {
     try {
         const { userId, name, message, targets, pricePerMessage, autoStartDelay } = req.body;
@@ -1790,21 +1728,13 @@ app.post('/api/campaign/start', async (req, res) => {
         
         await db.ref().update(targetUpdates);
 
-        logger.info({ 
-            campaignId, 
-            userId, 
-            targetCount: targets.length,
-            scheduledTime: scheduledTime ? new Date(scheduledTime).toISOString() : 'immediate',
-            status: scheduledTime ? 'paused (scheduled)' : 'running'
-        }, 'Campaign created');
+        logger.info({ campaignId, userId, targetCount: targets.length, scheduledTime, status: scheduledTime ? 'paused (scheduled)' : 'running' }, 'Campaign created');
 
-        if (!scheduledTime) {
-            runCampaign(campaignId);
-        } else {
+        // No need to call runCampaign directly if status is 'running'
+        // The Firebase listener 'child_added' will detect it and start automatically!
+        if (scheduledTime) {
             scheduleCampaignStart(campaignId, scheduledTime);
-            
             if (userId) {
-                const delayHours = autoStartDelay;
                 const startTime = new Date(scheduledTime).toLocaleString('en-US', { 
                     timeZone: 'Asia/Dhaka',
                     hour: '2-digit',
@@ -1816,7 +1746,7 @@ app.post('/api/campaign/start', async (req, res) => {
                     userId: userId,
                     type: 'campaign_scheduled',
                     title: '📅 Campaign Scheduled',
-                    message: `Campaign "${name}" will auto-start in ${delayHours} hour(s) at ${startTime}.`,
+                    message: `Campaign "${name}" will auto-start in ${autoStartDelay} hour(s) at ${startTime}.`,
                     campaignId: campaignId,
                     read: false,
                     createdAt: admin.database.ServerValue.TIMESTAMP
@@ -1837,503 +1767,11 @@ app.post('/api/campaign/start', async (req, res) => {
     }
 });
 
-// 6. SEND SINGLE MESSAGE (with delivery tracking)
-app.post('/api/send', async (req, res) => {
-    try {
-        const { accountId, to, text, userId } = req.body;
-        
-        if (!accountId || !to || !text) {
-            return res.status(400).json({ success: false, error: 'Missing fields' });
-        }
-
-        const sock = sessions.get(accountId);
-        if (!sock || sessionStates.get(accountId)?.status !== 'connected') {
-            return res.status(400).json({ success: false, error: 'Account not connected' });
-        }
-
-        const cleanTo = cleanPhoneNumber(to);
-        const jidTo = jid(cleanTo);
-        const result = await sock.sendMessage(jidTo, { text });
-        const msgId = result?.key?.id;
-
-        if (!msgId) {
-            return res.status(400).json({ success: false, error: 'Message not confirmed' });
-        }
-
-        // Account daily count update
-        const newCount = (todayCounts.get(accountId) || 0) + 1;
-        todayCounts.set(accountId, newCount);
-        await db.ref('whatsapp_accounts/' + accountId).update({
-            todaySent: newCount,
-            updatedAt: admin.database.ServerValue.TIMESTAMP
-        });
-
-        // Message log save with delivery tracking
-        await db.ref('message_logs').push().set({
-            accountId, 
-            userId: userId || '', 
-            targetPhone: cleanTo,
-            messageId: msgId,
-            messageText: text,
-            status: 'sent',
-            deliveryStatus: 'PENDING',
-            paymentAdded: false,
-            sentAt: admin.database.ServerValue.TIMESTAMP
-        });
-
-        res.json({ 
-            success: true, 
-            messageId: msgId, 
-            todaySent: newCount,
-            message: 'Message sent. Delivery verification in progress.'
-        });
-    } catch (err) {
-        res.status(400).json({ success: false, error: err.message });
-    }
-});
-
-// 7. GET CAMPAIGN STATUS (with delivered count)
-app.get('/api/campaign/:id/status', async (req, res) => {
-    try {
-        const campaignSnap = await db.ref('campaigns/' + req.params.id).once('value');
-        if (!campaignSnap.exists()) {
-            return res.status(404).json({ success: false, error: 'Campaign not found' });
-        }
-        
-        const campaign = campaignSnap.val();
-        
-        const progressSnap = await db.ref('campaign_progress/' + req.params.id).once('value');
-        const progress = progressSnap.val() || {};
-        
-        // Count delivered messages
-        const targetsSnap = await db.ref('campaign_targets/' + req.params.id).once('value');
-        let deliveredCount = 0;
-        targetsSnap.forEach(child => {
-            if (child.val().verified) deliveredCount++;
-        });
-        
-        const progressSummary = {};
-        Object.entries(progress).forEach(([key, val]) => {
-            if (val.accountId) {
-                progressSummary[val.accountId] = {
-                    sentCount: val.sentCount || 0,
-                    deliveredCount: val.deliveredCount || 0,
-                    earned: val.earned || 0,
-                    status: val.status
-                };
-            }
-        });
-        
-        let timeRemaining = null;
-        if (campaign.status === 'paused' && campaign.scheduledStartTime) {
-            timeRemaining = Math.max(0, campaign.scheduledStartTime - Date.now());
-        }
-        
-        res.json({
-            success: true,
-            campaign: {
-                ...campaign,
-                id: req.params.id,
-                isRunning: activeCampaigns.has(req.params.id),
-                deliveredCount: deliveredCount,
-                progress: progressSummary,
-                timeRemaining: timeRemaining
-            }
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 8. PAUSE CAMPAIGN
-app.post('/api/campaign/:id/pause', async (req, res) => {
-    try {
-        const campaignId = req.params.id;
-        
-        if (scheduledTimers.has(campaignId)) {
-            clearTimeout(scheduledTimers.get(campaignId));
-            scheduledTimers.delete(campaignId);
-        }
-        
-        if (campaignRetryTimers.has(campaignId)) {
-            clearTimeout(campaignRetryTimers.get(campaignId));
-            campaignRetryTimers.delete(campaignId);
-        }
-        
-        await db.ref('campaigns/' + campaignId).update({
-            status: 'paused',
-            scheduledStartTime: null,
-            pausedAt: admin.database.ServerValue.TIMESTAMP,
-            updatedAt: admin.database.ServerValue.TIMESTAMP
-        });
-        
-        logger.info({ campaignId }, '⏸️ Campaign paused (scheduled timer cleared)');
-        
-        res.json({ success: true, message: 'Campaign paused successfully' });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 9. RESUME CAMPAIGN
-app.post('/api/campaign/:id/resume', async (req, res) => {
-    try {
-        const campaignId = req.params.id;
-        
-        if (campaignRetryTimers.has(campaignId)) {
-            clearTimeout(campaignRetryTimers.get(campaignId));
-            campaignRetryTimers.delete(campaignId);
-        }
-        
-        if (scheduledTimers.has(campaignId)) {
-            clearTimeout(scheduledTimers.get(campaignId));
-            scheduledTimers.delete(campaignId);
-        }
-        
-        await db.ref('campaigns/' + campaignId).update({
-            status: 'running',
-            scheduledStartTime: null,
-            resumedAt: admin.database.ServerValue.TIMESTAMP,
-            updatedAt: admin.database.ServerValue.TIMESTAMP
-        });
-        
-        logger.info({ campaignId }, '▶️ Campaign resumed (starting immediately)');
-        
-        if (!activeCampaigns.has(campaignId)) {
-            runCampaign(campaignId);
-        }
-        
-        res.json({ success: true, message: 'Campaign resumed successfully' });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 10. UPDATE CAMPAIGN SCHEDULED TIME
-app.post('/api/campaign/:id/schedule', async (req, res) => {
-    try {
-        const campaignId = req.params.id;
-        const { delayHours } = req.body;
-        
-        if (!delayHours || delayHours < 0) {
-            return res.status(400).json({ success: false, error: 'Invalid delay hours' });
-        }
-        
-        const scheduledTime = Date.now() + delayHours * 3600000;
-        
-        await db.ref('campaigns/' + campaignId).update({
-            scheduledStartTime: scheduledTime,
-            updatedAt: admin.database.ServerValue.TIMESTAMP
-        });
-        
-        scheduleCampaignStart(campaignId, scheduledTime);
-        
-        logger.info({ campaignId, scheduledTime: new Date(scheduledTime).toISOString() }, '📅 Campaign schedule updated');
-        
-        res.json({ 
-            success: true, 
-            scheduledStartTime: scheduledTime,
-            message: `Campaign scheduled to start in ${delayHours} hour(s)`
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 11. GET ALL CAMPAIGNS
-app.get('/api/campaigns', async (req, res) => {
-    try {
-        const { status, userId } = req.query;
-        
-        let query = db.ref('campaigns');
-        
-        if (userId) {
-            query = query.orderByChild('userId').equalTo(userId);
-        }
-        
-        const snap = await query.once('value');
-        const campaigns = [];
-        
-        snap.forEach(child => {
-            const campaign = child.val();
-            
-            if (status) {
-                const statuses = status.split(',');
-                if (!statuses.includes(campaign.status)) return;
-            }
-            
-            if (campaign.status === 'running' || campaign.status === 'paused' || campaign.status === 'completed' || campaign.status === 'error') {
-                campaigns.push({
-                    id: child.key,
-                    ...campaign,
-                    isRunning: activeCampaigns.has(child.key),
-                    timeRemaining: campaign.scheduledStartTime ? Math.max(0, campaign.scheduledStartTime - Date.now()) : null
-                });
-            }
-        });
-        
-        res.json({ success: true, campaigns });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
 // ============================================
-// 🆕 REFERRAL SYSTEM API ENDPOINTS
+// CRON JOBS
 // ============================================
 
-// 12. GET REFERRAL SETTINGS (Admin)
-app.get('/api/referral/settings', async (req, res) => {
-    try {
-        const settingsSnap = await db.ref('app_settings/referral_settings').once('value');
-        const settings = settingsSnap.val() || {};
-        res.json({ success: true, settings });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 13. UPDATE REFERRAL SETTINGS (Admin)
-app.post('/api/referral/settings', async (req, res) => {
-    try {
-        const {
-            conditionType,
-            conditionValue,
-            conditionMessage,
-            conditionActive,
-            level1Commission,
-            level2Commission,
-            level3Commission,
-            levelBonus,
-            topReferrerBonus
-        } = req.body;
-        
-        const updates = {
-            conditionType: conditionType || 'withdrawal',
-            conditionValue: conditionValue || 1,
-            conditionMessage: conditionMessage || 'First withdrawal must be successful',
-            conditionActive: conditionActive !== undefined ? conditionActive : true,
-            level1Commission: level1Commission || 10,
-            level2Commission: level2Commission || 5,
-            level3Commission: level3Commission || 2,
-            levelBonus: levelBonus || { "5": 100, "10": 250, "20": 500 },
-            topReferrerBonus: topReferrerBonus || 1000,
-            updatedAt: admin.database.ServerValue.TIMESTAMP
-        };
-        
-        await db.ref('app_settings/referral_settings').update(updates);
-        
-        logger.info('✅ Referral settings updated');
-        
-        res.json({ success: true, settings: updates, message: 'Referral settings updated successfully' });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 14. GET USER REFERRAL INFO
-app.get('/api/referral/:userId', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-        
-        // Generate referral code if not exists
-        const referralCode = await generateUserReferralCode(userId);
-        
-        // Get referral stats
-        const statsSnap = await db.ref('users/' + userId + '/referralStats').once('value');
-        const stats = statsSnap.val() || {};
-        
-        // Get referral settings
-        const settingsSnap = await db.ref('app_settings/referral_settings').once('value');
-        const settings = settingsSnap.val() || {};
-        
-        // Get referred users
-        const referralsSnap = await db.ref('referrals')
-            .orderByChild('referrerId')
-            .equalTo(userId)
-            .once('value');
-        
-        const referredUsers = [];
-        referralsSnap.forEach(child => {
-            referredUsers.push({
-                id: child.key,
-                ...child.val()
-            });
-        });
-        
-        res.json({
-            success: true,
-            referralCode,
-            stats,
-            settings: {
-                conditionMessage: settings.conditionMessage,
-                level1Commission: settings.level1Commission,
-                level2Commission: settings.level2Commission,
-                level3Commission: settings.level3Commission,
-                levelBonus: settings.levelBonus
-            },
-            referredUsers
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 15. PROCESS REFERRAL (When new user signs up with referral code)
-app.post('/api/referral/process', async (req, res) => {
-    try {
-        const { userId, referralCode } = req.body;
-        
-        if (!userId || !referralCode) {
-            return res.status(400).json({ success: false, error: 'Missing required fields' });
-        }
-        
-        const success = await processReferral(userId, referralCode);
-        
-        res.json({ 
-            success, 
-            message: success ? 'Referral processed successfully' : 'Failed to process referral'
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 16. GET REFERRAL LEADERBOARD
-app.get('/api/referral/leaderboard', async (req, res) => {
-    try {
-        const { limit = 10 } = req.query;
-        
-        const usersSnap = await db.ref('users').once('value');
-        const leaderboard = [];
-        
-        usersSnap.forEach(child => {
-            const user = child.val();
-            if (user.referralStats) {
-                leaderboard.push({
-                    userId: child.key,
-                    name: user.name || 'Anonymous',
-                    totalReferred: user.referralStats.totalReferred || 0,
-                    successfulReferred: user.referralStats.successfulReferred || 0,
-                    totalBonusEarned: user.referralStats.totalBonusEarned || 0,
-                    monthlyReferrals: user.referralStats.monthlyReferrals || 0,
-                    monthlyBonus: user.referralStats.monthlyBonus || 0
-                });
-            }
-        });
-        
-        // Sort by successful referrals
-        leaderboard.sort((a, b) => b.successfulReferred - a.successfulReferred);
-        
-        // Return top N
-        const topReferrers = leaderboard.slice(0, parseInt(limit));
-        
-        res.json({ 
-            success: true, 
-            leaderboard: topReferrers,
-            total: leaderboard.length
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 17. CHECK REFERRAL CONDITION STATUS
-app.get('/api/referral/check/:userId', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-        
-        const refSnap = await db.ref('referrals/' + userId).once('value');
-        if (!refSnap.exists()) {
-            return res.json({ 
-                success: true, 
-                isReferred: false,
-                conditionMet: false 
-            });
-        }
-        
-        const settingsSnap = await db.ref('app_settings/referral_settings').once('value');
-        const settings = settingsSnap.val() || {};
-        
-        let conditionMet = false;
-        let conditionMessage = '';
-        
-        if (settings.conditionType === 'withdrawal') {
-            const withdrawalsSnap = await db.ref('withdrawals')
-                .orderByChild('userId')
-                .equalTo(userId)
-                .once('value');
-            
-            let successCount = 0;
-            withdrawalsSnap.forEach(child => {
-                if (child.val().status === 'completed' || child.val().status === 'successful') {
-                    successCount++;
-                }
-            });
-            
-            conditionMet = successCount >= settings.conditionValue;
-            conditionMessage = `${successCount}/${settings.conditionValue} withdrawals completed`;
-            
-        } else if (settings.conditionType === 'messageCount') {
-            const userSnap = await db.ref('users/' + userId).once('value');
-            const userData = userSnap.val() || {};
-            const totalSent = userData.totalSent || 0;
-            
-            conditionMet = totalSent >= settings.conditionValue;
-            conditionMessage = `${totalSent}/${settings.conditionValue} messages sent`;
-        }
-        
-        res.json({
-            success: true,
-            isReferred: true,
-            conditionMet,
-            conditionType: settings.conditionType,
-            conditionMessage,
-            referralStatus: refSnap.val().status
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 18. GET MESSAGE DELIVERY STATUS
-app.get('/api/message/:messageId/status', async (req, res) => {
-    try {
-        const messageId = req.params.messageId;
-        
-        const logSnap = await db.ref('message_logs')
-            .orderByChild('messageId')
-            .equalTo(messageId)
-            .once('value');
-        
-        if (!logSnap.exists()) {
-            return res.status(404).json({ success: false, error: 'Message not found' });
-        }
-        
-        let messageData = null;
-        logSnap.forEach(child => {
-            messageData = {
-                id: child.key,
-                ...child.val()
-            };
-        });
-        
-        res.json({
-            success: true,
-            message: {
-                ...messageData,
-                isDelivered: messageData.paymentAdded || false,
-                deliveryStatus: messageData.deliveryStatus || 'UNKNOWN'
-            }
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// ============================================
-// MIDNIGHT CRON (reset todaySent)
-// ============================================
+// Midnight reset (Daily)
 cron.schedule('0 0 * * *', async () => {
     try {
         console.log('🕛 Midnight reset - clearing daily counts');
@@ -2362,14 +1800,11 @@ cron.schedule('0 0 * * *', async () => {
     timezone: "Asia/Dhaka"
 });
 
-// ============================================
-// 🆕 MONTHLY REFERRAL RESET (1st of every month)
-// ============================================
+// Monthly Referral Reset & Bonus Distribution
 cron.schedule('0 0 1 * *', async () => {
     try {
-        console.log('📅 Monthly reset - clearing monthly referral stats');
+        console.log('📅 Monthly reset - processing top referrer bonuses');
         
-        // Pay top referrer bonus before reset
         const settingsSnap = await db.ref('app_settings/referral_settings').once('value');
         const settings = settingsSnap.val() || {};
         const topBonus = settings.topReferrerBonus || 0;
@@ -2391,7 +1826,6 @@ cron.schedule('0 0 1 * *', async () => {
             
             topReferrers.sort((a, b) => b.monthlyReferrals - a.monthlyReferrals);
             
-            // Pay top 3
             for (let i = 0; i < Math.min(3, topReferrers.length); i++) {
                 const bonus = i === 0 ? topBonus : Math.floor(topBonus / 2);
                 await db.ref('users/' + topReferrers[i].userId + '/balance').transaction(bal => (bal || 0) + bonus);
@@ -2450,7 +1884,7 @@ setInterval(async () => {
 }, 300000);
 
 // ============================================
-// HEALTH CHECK - Keep alive for Render
+// HEALTH CHECK
 // ============================================
 setInterval(() => {
     const connectedSessions = Array.from(sessionStates.values())
@@ -2471,7 +1905,6 @@ setInterval(() => {
 // ============================================
 async function loadAllSessions() {
     try {
-        // Initialize referral system
         await initializeReferralSystem();
         
         const snap = await db.ref('whatsapp_accounts').once('value');
@@ -2510,22 +1943,8 @@ async function loadAllSessions() {
         await delay(2000);
         await rescheduleCampaigns();
         
-        await delay(3000);
-        const campaignsSnap = await db.ref('campaigns')
-            .orderByChild('status')
-            .equalTo('running')
-            .once('value');
-        
-        let resumedCount = 0;
-        campaignsSnap.forEach((child) => {
-            logger.info({ campaignId: child.key }, '▶️ Resuming campaign');
-            runCampaign(child.key);
-            resumedCount++;
-        });
-        
-        if (resumedCount > 0) {
-            logger.info({ resumedCount }, '✅ Campaigns resumed');
-        }
+        // No need to explicitly resume campaigns here
+        // Firebase listeners will detect running campaigns and start them
         
     } catch (err) {
         logger.error({ err }, 'Session load error');
@@ -2555,7 +1974,6 @@ process.on('SIGTERM', async () => {
     }
     scheduledTimers.clear();
     
-    // Clear message delivery queue
     messageDeliveryQueue.clear();
     
     for (const sessionId of sessions.keys()) {
@@ -2573,13 +1991,13 @@ process.on('SIGTERM', async () => {
 // ============================================
 app.listen(PORT, async () => {
     console.log('═══════════════════════════════════════════');
-    console.log(`🚀 WS-Income Engine v4.0 on port ${PORT}`);
+    console.log(`🚀 WS-Income Engine v5.0 on port ${PORT}`);
     console.log('📡 Firebase Realtime Database');
-    console.log('🔧 Campaign Engine with Auto-Start Timer');
-    console.log('👥 Multi-Level Referral System');
-    console.log('⏰ Scheduled Campaign Support');
-    console.log('📬 Message Delivery Tracking with Payment');
-    console.log('💰 Automatic Payment on Delivery Confirmation');
+    console.log('⚡ Event-Driven Architecture');
+    console.log('🎯 Only 5 Core API Endpoints');
+    console.log('🤖 Automated via Firebase Listeners & Cron');
+    console.log('👥 Multi-Level Referral System (Auto)');
+    console.log('📬 Message Delivery Tracking with Auto-Payment');
     console.log('🌍 Timezone: Asia/Dhaka');
     console.log('═══════════════════════════════════════════');
     await loadAllSessions();
